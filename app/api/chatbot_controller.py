@@ -3,7 +3,6 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from app.models.qa_request import QARequest
 from app.models.qa_response import QAResponse
 from app.services.chatbot_service import ChatbotService
-from app.services.storage_service import StorageService
 import os
 from typing import List, Optional
 import aiofiles
@@ -12,7 +11,7 @@ import google.generativeai as genai
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Directory to store uploaded markdown files (used for local development only)
+# Directory to store uploaded markdown files
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -103,11 +102,9 @@ async def debug_info():
         except Exception as e:
             error_message = str(e)
         
-        # Check Supabase configuration
-        supabase_url = os.getenv("SUPABASE_URL", "")
-        supabase_key = os.getenv("SUPABASE_KEY", "")
-        supabase_configured = bool(supabase_url) and bool(supabase_key)
-        masked_supabase_key = f"{supabase_key[:4]}...{supabase_key[-4:]}" if len(supabase_key) > 8 else "Not set"
+        # Check uploads directory
+        uploads_dir_exists = os.path.exists(UPLOAD_DIR)
+        uploads_dir_writable = os.access(UPLOAD_DIR, os.W_OK) if uploads_dir_exists else False
         
         return {
             "success": True,
@@ -119,9 +116,11 @@ async def debug_info():
             "gemini_client_configured": client_configured,
             "gemini_api_working": api_working,
             "api_error_message": error_message,
-            "supabase_configured": supabase_configured,
-            "supabase_url": supabase_url,
-            "supabase_key_masked": masked_supabase_key,
+            "uploads_dir": {
+                "path": UPLOAD_DIR,
+                "exists": uploads_dir_exists,
+                "writable": uploads_dir_writable
+            },
             "env_file_exists": env_file_exists,
             "env_file_path": env_file_path,
             "cwd": os.getcwd()
@@ -132,6 +131,42 @@ async def debug_info():
             "success": False,
             "error": str(e)
         }
+
+@router.get("/files",
+            summary="List uploaded markdown files",
+            description="Get a list of all uploaded markdown files")
+async def list_files():
+    """
+    Endpoint to list all uploaded markdown files.
+    """
+    try:
+        # Use local file system storage for both development and production
+        files = []
+        if os.path.exists(UPLOAD_DIR):
+            for filename in os.listdir(UPLOAD_DIR):
+                if filename.endswith(('.md', '.markdown')):
+                    file_path = os.path.join(UPLOAD_DIR, filename)
+                    files.append({
+                        "filename": filename,
+                        "size": os.path.getsize(file_path),
+                        "last_modified": os.path.getmtime(file_path),
+                        "path": file_path
+                    })
+        
+        return {
+            "success": True,
+            "message": f"Found {len(files)} markdown files",
+            "data": {
+                "files": files
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to list files: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to list files"
+        )
 
 @router.post("/upload",
             summary="Upload a markdown document",
@@ -145,7 +180,7 @@ async def upload_markdown(
     
     This endpoint:
     1. Validates the uploaded file is a markdown file
-    2. Saves the file to the storage (local or Supabase)
+    2. Saves the file to the local file system
     3. Returns the file information
     """
     try:
@@ -164,59 +199,25 @@ async def upload_markdown(
         # Read file content
         content = await file.read()
         
-        # Store the file based on environment
-        if IS_PRODUCTION:
-            # Use Supabase in production
-            try:
-                file_info = await StorageService.upload_file(content, safe_filename)
-                logger.info(f"Successfully uploaded file to Supabase: {file_info}")
-                
-                return {
-                    "success": True,
-                    "message": "File uploaded successfully to cloud storage",
-                    "data": {
-                        "filename": safe_filename,
-                        "description": description,
-                        "size": file_info["size"],
-                        "url": file_info["url"]
-                    }
-                }
-            except Exception as e:
-                logger.error(f"Failed to upload to Supabase: {str(e)}")
-                
-                # Fallback to memory-only operation - let the frontend know this won't persist
-                return {
-                    "success": True,
-                    "message": "File processed but not stored (storage error)",
-                    "data": {
-                        "filename": safe_filename,
-                        "description": description,
-                        "size": len(content),
-                        "content": content.decode('utf-8'),
-                        "temporary": True,
-                        "error": str(e)
-                    }
-                }
-        else:
-            # Use local storage in development
-            file_path = os.path.join(UPLOAD_DIR, safe_filename)
-            
-            # Save the file locally
-            async with aiofiles.open(file_path, 'wb') as out_file:
-                await out_file.write(content)
-            
-            logger.info(f"Successfully saved file to local path: {file_path}")
-            
-            return {
-                "success": True,
-                "message": "File uploaded successfully to local storage",
-                "data": {
-                    "filename": safe_filename,
-                    "description": description,
-                    "size": len(content),
-                    "path": file_path
-                }
+        # Save to file system (both in development and production)
+        file_path = os.path.join(UPLOAD_DIR, safe_filename)
+        
+        # Save the file locally
+        async with aiofiles.open(file_path, 'wb') as out_file:
+            await out_file.write(content)
+        
+        logger.info(f"Successfully saved file to path: {file_path}")
+        
+        return {
+            "success": True,
+            "message": "File uploaded successfully",
+            "data": {
+                "filename": safe_filename,
+                "description": description,
+                "size": len(content),
+                "path": file_path
             }
+        }
         
     except HTTPException as e:
         raise e
@@ -227,66 +228,6 @@ async def upload_markdown(
             detail="Failed to upload file"
         )
 
-@router.get("/files",
-            summary="List uploaded markdown files",
-            description="Get a list of all uploaded markdown files")
-async def list_files():
-    """
-    Endpoint to list all uploaded markdown files.
-    """
-    try:
-        if IS_PRODUCTION:
-            # Use Supabase in production
-            try:
-                files = await StorageService.list_files()
-                return {
-                    "success": True,
-                    "message": f"Found {len(files)} markdown files",
-                    "data": {
-                        "files": files
-                    }
-                }
-            except Exception as e:
-                logger.error(f"Failed to list files from Supabase: {str(e)}")
-                # Fallback to empty list if Supabase fails
-                return {
-                    "success": True,
-                    "message": "No files available (storage error)",
-                    "data": {
-                        "files": [],
-                        "error": str(e)
-                    }
-                }
-        else:
-            # Use local storage in development
-            files = []
-            for filename in os.listdir(UPLOAD_DIR):
-                if filename.endswith(('.md', '.markdown')):
-                    file_path = os.path.join(UPLOAD_DIR, filename)
-                    files.append({
-                        "filename": filename,
-                        "size": os.path.getsize(file_path),
-                        "last_modified": os.path.getmtime(file_path),
-                        "path": file_path
-                    })
-            
-            return {
-                "success": True,
-                "message": f"Found {len(files)} markdown files",
-                "data": {
-                    "files": files
-                }
-            }
-        
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Failed to list files: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to list files"
-        )
-
 @router.get("/file/{filename}",
             summary="Get content of a markdown file",
             description="Get the content of a specific markdown file")
@@ -295,49 +236,27 @@ async def get_file_content(filename: str):
     Endpoint to get the content of a markdown file.
     """
     try:
-        if IS_PRODUCTION:
-            # Use Supabase in production
-            try:
-                content, file_url = await StorageService.get_file_content(filename)
-                return {
-                    "success": True,
-                    "message": "File content retrieved successfully",
-                    "data": {
-                        "filename": filename,
-                        "content": content.decode('utf-8'),
-                        "url": file_url
-                    }
-                }
-            except Exception as e:
-                logger.error(f"Failed to get file from Supabase: {str(e)}")
-                # Return a friendly error
-                return {
-                    "success": False,
-                    "message": "File not found or could not be retrieved",
-                    "error": str(e)
-                }
-        else:
-            # Use local storage in development
-            file_path = os.path.join(UPLOAD_DIR, filename)
-            
-            if not os.path.exists(file_path):
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="File not found"
-                )
-            
-            async with aiofiles.open(file_path, 'r', encoding='utf-8') as file:
-                content = await file.read()
-            
-            return {
-                "success": True,
-                "message": "File content retrieved successfully",
-                "data": {
-                    "filename": filename,
-                    "content": content,
-                    "path": file_path
-                }
+        # Use local file system for both development and production
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        
+        if not os.path.exists(file_path):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found"
+            )
+        
+        async with aiofiles.open(file_path, 'r', encoding='utf-8') as file:
+            content = await file.read()
+        
+        return {
+            "success": True,
+            "message": "File content retrieved successfully",
+            "data": {
+                "filename": filename,
+                "content": content,
+                "path": file_path
             }
+        }
         
     except HTTPException as e:
         raise e
