@@ -35,10 +35,10 @@ class EmbeddingService:
         self.api_key = api_key
         # Correct format for the specified model
         self.model = "models/gemini-embedding-exp-03-07"
-        # Rate limiting parameters
+        # Rate limiting parameters - set to Google's documented limits
         self.request_count = 0
         self.last_request_time = time.time()
-        self.max_requests_per_minute = 10  # Adjust based on your quota
+        self.max_requests_per_minute = 15  # Google's limit is 15 RPM/TPM
         
         # In-memory embedding cache
         self._embedding_cache = {}
@@ -49,14 +49,30 @@ class EmbeddingService:
     def _load_embedding_cache(self):
         """Load embedding cache from disk."""
         cache_path = os.path.join(CACHE_DIR, "document_embeddings.json")
+        template_cache_path = os.path.join(CACHE_DIR, "template_embeddings.json")
+        
+        # Try to load document embeddings
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, 'r') as f:
                     self._embedding_cache = json.load(f)
-                logger.info(f"Loaded {len(self._embedding_cache)} cached embeddings")
+                logger.info(f"Loaded {len(self._embedding_cache)} cached document embeddings")
             except Exception as e:
-                logger.error(f"Error loading embedding cache: {str(e)}")
+                logger.error(f"Error loading document embedding cache: {str(e)}")
                 self._embedding_cache = {}
+                
+        # Try to load template embeddings into the same cache
+        if os.path.exists(template_cache_path):
+            try:
+                with open(template_cache_path, 'r') as f:
+                    template_cache = json.load(f)
+                    # Add template cache keys to main cache
+                    for key, value in template_cache.items():
+                        template_key = f"template_{key}"
+                        self._embedding_cache[template_key] = value
+                logger.info(f"Loaded {len(template_cache)} cached template embeddings")
+            except Exception as e:
+                logger.error(f"Error loading template embedding cache: {str(e)}")
     
     def _save_embedding_cache(self):
         """Save embedding cache to disk."""
@@ -76,6 +92,34 @@ class EmbeddingService:
                 logger.info(f"Saved {len(self._embedding_cache)} embeddings to cache")
             except Exception as e:
                 logger.error(f"Error saving embedding cache: {str(e)}")
+    
+    def save_template_embedding(self, template_id: str, embedding: List[float]):
+        """Save a specific template embedding to the template cache file."""
+        template_cache_path = os.path.join(CACHE_DIR, "template_embeddings.json")
+        
+        # Load existing template cache
+        template_cache = {}
+        if os.path.exists(template_cache_path):
+            try:
+                with open(template_cache_path, 'r') as f:
+                    template_cache = json.load(f)
+            except Exception as e:
+                logger.error(f"Error loading template cache for saving: {str(e)}")
+        
+        # Add the new template embedding
+        template_cache[template_id] = embedding
+        
+        # Also add to in-memory cache
+        template_key = f"template_{template_id}"
+        self._embedding_cache[template_key] = embedding
+        
+        # Save back to disk
+        try:
+            with open(template_cache_path, 'w') as f:
+                json.dump(template_cache, f)
+            logger.info(f"Saved template embedding for template {template_id} to cache")
+        except Exception as e:
+            logger.error(f"Error saving template cache: {str(e)}")
         
     def _handle_rate_limit(self):
         """Handle rate limiting to avoid 429 errors."""
@@ -90,26 +134,30 @@ class EmbeddingService:
         
         # If we're approaching the rate limit, add delay
         if self.request_count >= self.max_requests_per_minute:
-            sleep_time = 60 - time_diff + random.uniform(0.1, 1.0)
+            # Sleep until the minute is up plus a small random buffer
+            sleep_time = 60 - time_diff + random.uniform(1.0, 5.0)
             logger.info(f"Rate limit approached, sleeping for {sleep_time:.2f} seconds")
             time.sleep(sleep_time)
             self.request_count = 0
             self.last_request_time = time.time()
         
-    def generate_embedding(self, text: str, task_type: str = "SEMANTIC_SIMILARITY") -> Optional[List[float]]:
+    def generate_embedding(self, text: str, task_type: str = "SEMANTIC_SIMILARITY", is_template: bool = False, template_id: str = None) -> Optional[List[float]]:
         """
         Generate an embedding for a text using Gemini API.
         
         Args:
             text: Text to generate embedding for
             task_type: The type of task for which the embedding will be used
-                       Options: RETRIEVAL_QUERY, SEMANTIC_SIMILARITY, etc.
+            is_template: Whether this is a template embedding
+            template_id: ID of the template if is_template is True
                        
         Returns:
             List of floating point numbers representing the embedding or None if error
         """
         # Create a cache key from the text and task type
         cache_key = f"{hash(text)}-{task_type}"
+        if is_template and template_id:
+            cache_key = f"template_{template_id}"
         
         # Check if we have a cached embedding
         if cache_key in self._embedding_cache:
@@ -147,8 +195,11 @@ class EmbeddingService:
             # Cache the embedding
             self._embedding_cache[cache_key] = embedding
             
-            # Periodically save cache to disk
-            if len(self._embedding_cache) % 10 == 0:
+            # If it's a template, save to the dedicated template cache
+            if is_template and template_id:
+                self.save_template_embedding(template_id, embedding)
+            # Otherwise, periodically save document embeddings
+            elif len(self._embedding_cache) % 5 == 0:
                 self._save_embedding_cache()
             
             # Return small sample of embedding for debugging
@@ -176,6 +227,10 @@ class EmbeddingService:
                     # Cache the successful retry
                     self._embedding_cache[cache_key] = embedding
                     
+                    # If it's a template, save to the dedicated template cache after retry
+                    if is_template and template_id:
+                        self.save_template_embedding(template_id, embedding)
+                    
                     logger.info(f"Retry successful, generated embedding with {len(embedding)} dimensions")
                     return embedding
                 except Exception as retry_e:
@@ -198,9 +253,9 @@ class EmbeddingService:
             logger.info(f"Generating embedding for text {i+1}/{len(texts)}")
             embedding = self.generate_embedding(text, task_type)
             results.append(embedding)
-            # Add small delay between batch requests to avoid rate limits
+            # Add substantial delay between batch requests to avoid rate limits
             if i < len(texts) - 1:
-                time.sleep(1.0)  # Increased delay to be safer
+                time.sleep(5.0)  # Increased delay to be safer
         
         # Save cache after batch processing
         self._save_embedding_cache()

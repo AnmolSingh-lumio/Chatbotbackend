@@ -11,6 +11,8 @@ import markdown
 import time
 import json
 import os.path
+import threading
+import asyncio
 from google.api_core.exceptions import ResourceExhausted
 
 # Configure logging
@@ -58,72 +60,93 @@ TEMPLATE_CACHE_PATH = os.path.join(CACHE_DIR, "template_embeddings.json")
 # Document embedding cache to avoid regenerating the same embeddings
 document_embedding_cache = {}
 
-# Load cached template embeddings at startup
-def load_cached_template_embeddings():
-    """Load cached template embeddings from disk if available."""
-    if os.path.exists(TEMPLATE_CACHE_PATH):
-        try:
-            with open(TEMPLATE_CACHE_PATH, 'r') as f:
-                cached_templates = json.load(f)
+# Template embedding initialization flag
+is_template_initialization_in_progress = False
+is_embedding_initialized = False
+
+# Safely generate template embeddings with appropriate delays
+def initialize_template_embeddings_safely():
+    """
+    Generate embeddings for templates if not already available and cache them.
+    Use appropriate delays to avoid rate limits.
+    """
+    global is_embedding_initialized, is_template_initialization_in_progress
+    
+    if is_embedding_initialized or is_template_initialization_in_progress:
+        return
+    
+    is_template_initialization_in_progress = True
+    logger.info("Starting initialization of template embeddings in background thread")
+    
+    try:
+        # Check if any templates need embeddings
+        needs_embeddings = False
+        
+        # First check cache file
+        cached_embeddings = {}
+        if os.path.exists(TEMPLATE_CACHE_PATH):
+            try:
+                with open(TEMPLATE_CACHE_PATH, 'r') as f:
+                    cached_embeddings = json.load(f)
+                logger.info(f"Loaded {len(cached_embeddings)} cached template embeddings")
+            except Exception as e:
+                logger.error(f"Error loading cached template embeddings: {str(e)}")
+                cached_embeddings = {}
+        
+        # Check if we need to generate any embeddings
+        for template in TemplateStore.templates:
+            template_id = str(template["id"])
+            if template_id not in cached_embeddings:
+                needs_embeddings = True
+                break
+        
+        if needs_embeddings:
+            logger.info("Generating embeddings for templates with proper delays")
             
-            # Update template store with cached embeddings
+            # Generate embeddings with significant delay between requests
             for template in TemplateStore.templates:
                 template_id = str(template["id"])
-                if template_id in cached_templates:
-                    template["embedding"] = cached_templates[template_id]
-                    logger.info(f"Loaded cached embedding for template {template_id}")
-            
-            logger.info(f"Successfully loaded cached template embeddings")
-            return True
-        except Exception as e:
-            logger.error(f"Error loading cached template embeddings: {str(e)}")
-    return False
-
-# Generate and cache template embeddings
-def initialize_template_embeddings():
-    """Generate embeddings for templates if not already available and cache them."""
-    # Check if any templates need embeddings
-    needs_embeddings = any(t["embedding"] is None for t in TemplateStore.templates)
-    
-    if needs_embeddings:
-        logger.info("Generating embeddings for question templates")
-        
-        # Dictionary to store the embeddings for caching
-        embeddings_to_cache = {}
-        
-        # Generate embeddings with delay between requests
-        for template in TemplateStore.templates:
-            if template["embedding"] is None:
-                # Use SEMANTIC_SIMILARITY for better matching of similar questions
+                
+                # Check if already cached on disk
+                if template_id in cached_embeddings:
+                    template["embedding"] = cached_embeddings[template_id]
+                    logger.info(f"Using cached embedding for template {template_id}")
+                    continue
+                
+                # Generate embedding with template-specific parameters
+                logger.info(f"Generating embedding for template {template_id}: {template['question_text'][:50]}...")
                 embedding = embedding_service.generate_embedding(
                     template["question_text"],
-                    task_type="SEMANTIC_SIMILARITY"
+                    task_type="SEMANTIC_SIMILARITY",
+                    is_template=True,
+                    template_id=template_id
                 )
+                
                 template["embedding"] = embedding
                 
-                # Store for caching
-                embeddings_to_cache[str(template["id"])] = embedding
-                
-                # Add delay to avoid rate limiting
-                time.sleep(1)
-        
-        # Save to cache file
-        try:
-            with open(TEMPLATE_CACHE_PATH, 'w') as f:
-                json.dump(embeddings_to_cache, f)
-            logger.info(f"Cached template embeddings to {TEMPLATE_CACHE_PATH}")
-        except Exception as e:
-            logger.error(f"Error caching template embeddings: {str(e)}")
+                # Add a significant delay between requests to avoid rate limits
+                # This is crucial for startup when many embeddings might be generated
+                logger.info(f"Added 10-second delay after generating template {template_id} embedding")
+                time.sleep(10)
             
-        logger.info(f"Generated embeddings for {len(embeddings_to_cache)} templates")
-    else:
-        logger.info("All templates already have embeddings")
+            logger.info(f"Template embeddings generation completed successfully")
+        else:
+            # Update templates with cached embeddings
+            for template in TemplateStore.templates:
+                template_id = str(template["id"])
+                if template_id in cached_embeddings:
+                    template["embedding"] = cached_embeddings[template_id]
+            
+            logger.info("All template embeddings already cached, using cached values")
+        
+        is_embedding_initialized = True
+    except Exception as e:
+        logger.error(f"Error initializing template embeddings: {str(e)}")
+    finally:
+        is_template_initialization_in_progress = False
 
-# Try to load cached embeddings, otherwise initialize them with delay
-if not load_cached_template_embeddings():
-    # We'll initialize these lazily to avoid startup delays
-    logger.info("No cached template embeddings found, will initialize on demand")
-is_embedding_initialized = False
+# Start template embedding generation in a background thread on startup
+threading.Thread(target=initialize_template_embeddings_safely, daemon=True).start()
 
 class ChatbotService:
     """Service for handling chatbot interactions."""
@@ -151,13 +174,37 @@ class ChatbotService:
             Dict containing the answer and metadata
         """
         try:
-            global is_embedding_initialized
+            global is_embedding_initialized, is_template_initialization_in_progress
             
-            # Initialize template embeddings if not done yet
+            # Check if template initialization is in progress
+            if is_template_initialization_in_progress:
+                logger.info("Template embeddings are still being initialized")
+                return {
+                    "success": False,
+                    "message": "System is initializing. Please try again in a minute.",
+                    "data": {
+                        "initializing": True
+                    }
+                }
+            
+            # If templates aren't initialized yet, wait for them
             if not is_embedding_initialized:
-                logger.info("Initializing template embeddings on first request")
-                initialize_template_embeddings()
-                is_embedding_initialized = True
+                logger.info("Waiting for template embeddings to be initialized")
+                # Wait up to 10 seconds for initialization to complete
+                for _ in range(10):
+                    if is_embedding_initialized:
+                        break
+                    await asyncio.sleep(1)
+                
+                # If still not initialized, return a message
+                if not is_embedding_initialized:
+                    return {
+                        "success": False,
+                        "message": "System is still initializing embeddings. Please try again in a minute.",
+                        "data": {
+                            "initializing": True
+                        }
+                    }
             
             # Initial validation
             if not request.question:

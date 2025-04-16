@@ -8,6 +8,7 @@ from typing import List, Optional
 import aiofiles
 import google.generativeai as genai
 import asyncio
+import json
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -312,4 +313,62 @@ async def delete_file(filename: str):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete file"
-        ) 
+        )
+
+@router.get("/status", 
+           summary="API status endpoint", 
+           description="Check status of API including embedding initialization")
+async def api_status():
+    """
+    Status endpoint to check if the API is ready for use.
+    """
+    from app.services.chatbot_service import is_embedding_initialized, is_template_initialization_in_progress
+    
+    try:
+        # Get embedding initialization status
+        embedding_status = {
+            "initialized": is_embedding_initialized,
+            "initialization_in_progress": is_template_initialization_in_progress
+        }
+        
+        # Check if template embedding cache exists
+        cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cache")
+        template_cache_path = os.path.join(cache_dir, "template_embeddings.json")
+        cache_exists = os.path.exists(template_cache_path)
+        
+        if cache_exists:
+            try:
+                with open(template_cache_path, 'r') as f:
+                    cached_data = json.load(f)
+                cache_info = {
+                    "exists": True,
+                    "template_count": len(cached_data),
+                    "last_modified": os.path.getmtime(template_cache_path)
+                }
+            except Exception as e:
+                cache_info = {
+                    "exists": True,
+                    "error": str(e),
+                    "last_modified": os.path.getmtime(template_cache_path)
+                }
+        else:
+            cache_info = {
+                "exists": False
+            }
+        
+        return {
+            "success": True,
+            "message": "API status check completed",
+            "data": {
+                "api_online": True,
+                "embedding_service": embedding_status,
+                "template_cache": cache_info,
+                "ready_for_queries": is_embedding_initialized and not is_template_initialization_in_progress
+            }
+        }
+    except Exception as e:
+        logger.error(f"Status endpoint error: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        } 
