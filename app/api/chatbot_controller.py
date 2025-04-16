@@ -7,6 +7,7 @@ import os
 from typing import List, Optional
 import aiofiles
 import google.generativeai as genai
+import asyncio
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -208,6 +209,10 @@ async def upload_markdown(
         
         logger.info(f"Successfully saved file to path: {file_path}")
         
+        # Add a 2-second artificial delay to prevent immediate embedding generation 
+        # that might trigger rate limits when the frontend makes immediate requests
+        await asyncio.sleep(2)
+        
         return {
             "success": True,
             "message": "File uploaded successfully",
@@ -215,7 +220,8 @@ async def upload_markdown(
                 "filename": safe_filename,
                 "description": description,
                 "size": len(content),
-                "path": file_path
+                "path": file_path,
+                "processing": True  # Signal to the frontend that processing is happening
             }
         }
         

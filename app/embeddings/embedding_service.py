@@ -5,6 +5,7 @@ import google.generativeai as genai
 from typing import List, Dict, Any, Optional
 import time
 import random
+import json
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,10 @@ else:
 # Configure the Gemini API with explicit API key
 genai.configure(api_key=api_key)
 
+# Setup cache directory
+CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 class EmbeddingService:
     def __init__(self):
         # Store the API key rather than loading it again
@@ -34,6 +39,43 @@ class EmbeddingService:
         self.request_count = 0
         self.last_request_time = time.time()
         self.max_requests_per_minute = 10  # Adjust based on your quota
+        
+        # In-memory embedding cache
+        self._embedding_cache = {}
+        
+        # Load embeddings from disk cache if available
+        self._load_embedding_cache()
+        
+    def _load_embedding_cache(self):
+        """Load embedding cache from disk."""
+        cache_path = os.path.join(CACHE_DIR, "document_embeddings.json")
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r') as f:
+                    self._embedding_cache = json.load(f)
+                logger.info(f"Loaded {len(self._embedding_cache)} cached embeddings")
+            except Exception as e:
+                logger.error(f"Error loading embedding cache: {str(e)}")
+                self._embedding_cache = {}
+    
+    def _save_embedding_cache(self):
+        """Save embedding cache to disk."""
+        # Only save if we have a reasonable number of embeddings to avoid disk overhead
+        if len(self._embedding_cache) > 0:
+            cache_path = os.path.join(CACHE_DIR, "document_embeddings.json")
+            try:
+                # Limit cache size to avoid excessive disk usage
+                if len(self._embedding_cache) > 500:
+                    # Keep only the most recent 500 entries
+                    sorted_keys = sorted(self._embedding_cache.keys())
+                    for key in sorted_keys[:-500]:
+                        del self._embedding_cache[key]
+                        
+                with open(cache_path, 'w') as f:
+                    json.dump(self._embedding_cache, f)
+                logger.info(f"Saved {len(self._embedding_cache)} embeddings to cache")
+            except Exception as e:
+                logger.error(f"Error saving embedding cache: {str(e)}")
         
     def _handle_rate_limit(self):
         """Handle rate limiting to avoid 429 errors."""
@@ -66,6 +108,14 @@ class EmbeddingService:
         Returns:
             List of floating point numbers representing the embedding or None if error
         """
+        # Create a cache key from the text and task type
+        cache_key = f"{hash(text)}-{task_type}"
+        
+        # Check if we have a cached embedding
+        if cache_key in self._embedding_cache:
+            logger.info(f"Using cached embedding for text: '{text[:30]}...'")
+            return self._embedding_cache[cache_key]
+            
         try:
             # Apply rate limiting
             self._handle_rate_limit()
@@ -94,6 +144,13 @@ class EmbeddingService:
             embedding = response["embedding"]
             logger.info(f"Successfully generated embedding with {len(embedding)} dimensions")
             
+            # Cache the embedding
+            self._embedding_cache[cache_key] = embedding
+            
+            # Periodically save cache to disk
+            if len(self._embedding_cache) % 10 == 0:
+                self._save_embedding_cache()
+            
             # Return small sample of embedding for debugging
             if len(embedding) > 5:
                 logger.info(f"Sample embedding values: {embedding[:5]}...")
@@ -115,6 +172,10 @@ class EmbeddingService:
                         task_type=task_type
                     )
                     embedding = response["embedding"]
+                    
+                    # Cache the successful retry
+                    self._embedding_cache[cache_key] = embedding
+                    
                     logger.info(f"Retry successful, generated embedding with {len(embedding)} dimensions")
                     return embedding
                 except Exception as retry_e:
@@ -137,7 +198,11 @@ class EmbeddingService:
             logger.info(f"Generating embedding for text {i+1}/{len(texts)}")
             embedding = self.generate_embedding(text, task_type)
             results.append(embedding)
-            # Add small delay between batch requests
+            # Add small delay between batch requests to avoid rate limits
             if i < len(texts) - 1:
-                time.sleep(0.5)
+                time.sleep(1.0)  # Increased delay to be safer
+        
+        # Save cache after batch processing
+        self._save_embedding_cache()
+        
         return results 

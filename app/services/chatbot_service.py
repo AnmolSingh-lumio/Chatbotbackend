@@ -9,6 +9,8 @@ from app.embeddings.vector_similarity_service import VectorSimilarityService
 from app.services.template_store import TemplateStore
 import markdown
 import time
+import json
+import os.path
 from google.api_core.exceptions import ResourceExhausted
 
 # Configure logging
@@ -47,6 +49,80 @@ model = genai.GenerativeModel("gemini-2.0-flash-001")
 
 # Initialize embedding service and template store
 embedding_service = EmbeddingService()
+
+# Path for caching template embeddings
+CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+TEMPLATE_CACHE_PATH = os.path.join(CACHE_DIR, "template_embeddings.json")
+
+# Document embedding cache to avoid regenerating the same embeddings
+document_embedding_cache = {}
+
+# Load cached template embeddings at startup
+def load_cached_template_embeddings():
+    """Load cached template embeddings from disk if available."""
+    if os.path.exists(TEMPLATE_CACHE_PATH):
+        try:
+            with open(TEMPLATE_CACHE_PATH, 'r') as f:
+                cached_templates = json.load(f)
+            
+            # Update template store with cached embeddings
+            for template in TemplateStore.templates:
+                template_id = str(template["id"])
+                if template_id in cached_templates:
+                    template["embedding"] = cached_templates[template_id]
+                    logger.info(f"Loaded cached embedding for template {template_id}")
+            
+            logger.info(f"Successfully loaded cached template embeddings")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading cached template embeddings: {str(e)}")
+    return False
+
+# Generate and cache template embeddings
+def initialize_template_embeddings():
+    """Generate embeddings for templates if not already available and cache them."""
+    # Check if any templates need embeddings
+    needs_embeddings = any(t["embedding"] is None for t in TemplateStore.templates)
+    
+    if needs_embeddings:
+        logger.info("Generating embeddings for question templates")
+        
+        # Dictionary to store the embeddings for caching
+        embeddings_to_cache = {}
+        
+        # Generate embeddings with delay between requests
+        for template in TemplateStore.templates:
+            if template["embedding"] is None:
+                # Use SEMANTIC_SIMILARITY for better matching of similar questions
+                embedding = embedding_service.generate_embedding(
+                    template["question_text"],
+                    task_type="SEMANTIC_SIMILARITY"
+                )
+                template["embedding"] = embedding
+                
+                # Store for caching
+                embeddings_to_cache[str(template["id"])] = embedding
+                
+                # Add delay to avoid rate limiting
+                time.sleep(1)
+        
+        # Save to cache file
+        try:
+            with open(TEMPLATE_CACHE_PATH, 'w') as f:
+                json.dump(embeddings_to_cache, f)
+            logger.info(f"Cached template embeddings to {TEMPLATE_CACHE_PATH}")
+        except Exception as e:
+            logger.error(f"Error caching template embeddings: {str(e)}")
+            
+        logger.info(f"Generated embeddings for {len(embeddings_to_cache)} templates")
+    else:
+        logger.info("All templates already have embeddings")
+
+# Try to load cached embeddings, otherwise initialize them with delay
+if not load_cached_template_embeddings():
+    # We'll initialize these lazily to avoid startup delays
+    logger.info("No cached template embeddings found, will initialize on demand")
 is_embedding_initialized = False
 
 class ChatbotService:
@@ -60,6 +136,9 @@ class ChatbotService:
     _rate_limit_time = 0
     _max_retries = 1
     
+    # Track which documents have been processed for embeddings to avoid repeating
+    _processed_documents = set()
+    
     @classmethod
     async def answer_question(cls, request):
         """
@@ -72,6 +151,14 @@ class ChatbotService:
             Dict containing the answer and metadata
         """
         try:
+            global is_embedding_initialized
+            
+            # Initialize template embeddings if not done yet
+            if not is_embedding_initialized:
+                logger.info("Initializing template embeddings on first request")
+                initialize_template_embeddings()
+                is_embedding_initialized = True
+            
             # Initial validation
             if not request.question:
                 return {
@@ -86,6 +173,18 @@ class ChatbotService:
                     "message": "Markdown content is required",
                     "data": None
                 }
+            
+            # Document identification (for caching)
+            doc_id = request.source_document if hasattr(request, 'source_document') else hash(request.markdown_content[:1000])
+            
+            # If this is a new document that we haven't seen before, 
+            # add a delay to allow time for the system to stabilize
+            # This helps prevent rate limits when a new document is uploaded
+            if doc_id not in cls._processed_documents:
+                logger.info(f"New document detected (ID: {doc_id}), adding processing delay")
+                cls._processed_documents.add(doc_id)
+                # Sleep for 2 seconds to avoid rate limits
+                time.sleep(2)
             
             # Model validation
             if not cls._model:
@@ -164,7 +263,7 @@ class ChatbotService:
                     
                     # If we have retries left, wait and try again
                     if attempt < cls._max_retries:
-                        retry_delay = 5
+                        retry_delay = 5 + (attempt * 5)  # Increasing backoff
                         logger.info(f"Waiting {retry_delay} seconds before retrying...")
                         time.sleep(retry_delay)
                     else:
