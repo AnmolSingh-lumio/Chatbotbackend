@@ -265,4 +265,45 @@ async def get_file_content(filename: str):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get file content"
+        )
+
+@router.delete("/files/{filename}",
+            summary="Delete a markdown file",
+            description="Delete a specific markdown file")
+async def delete_file(filename: str):
+    """
+    Endpoint to delete a markdown file.
+    """
+    try:
+        logger.info(f"Attempting to delete file: {filename}")
+        
+        # Use local file system for both development and production
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        
+        if not os.path.exists(file_path):
+            logger.warning(f"File not found for deletion: {file_path}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found"
+            )
+        
+        # Delete the file
+        os.remove(file_path)
+        logger.info(f"Successfully deleted file: {file_path}")
+        
+        return {
+            "success": True,
+            "message": f"File {filename} deleted successfully",
+            "data": {
+                "filename": filename
+            }
+        }
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Failed to delete file: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete file"
         ) 
