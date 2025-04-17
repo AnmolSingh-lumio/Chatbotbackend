@@ -5,146 +5,160 @@ logger = logging.getLogger(__name__)
 
 # In-memory storage for question templates
 class TemplateStore:
-    # Initialize with pre-defined templates
+    # Initialize with contract-specific templates
     templates = [
         {
             "id": 1,
-            "question_text": "What is the document about?",
-            "category": "General",
+            "question_text": "What is the contract start and end date?",
+            "category": "General Contract Terms",
             "embedding": None,  # Will be populated by the embedding service
             "answer_strategy": """
-To answer questions about what a document is about:
-1. Look for the title, headings, or introduction that summarize the document's purpose
-2. Identify the main topics or themes covered
-3. Note any explicit statements about the document's purpose or scope
-4. Summarize in 1-3 sentences what the document is primarily focused on
-5. Mention the type of document (guide, specification, report, etc.)
+To answer questions about contract start and end dates:
+1. Look for sections labeled "Term", "Duration", "Contract Period", or "Effective Date"
+2. Identify specific dates mentioned for contract commencement
+3. Find specific dates mentioned for contract termination or expiration
+4. Note any statements about the contract length (e.g., "shall remain in effect for 24 months")
+5. If exact dates aren't specified, look for relative terms (e.g., "effective upon signing" or "expires 12 months after effective date")
 """
         },
         {
             "id": 2,
-            "question_text": "What are the key points of this document?",
-            "category": "General",
+            "question_text": "Is there an automatic renewal clause in the contract?",
+            "category": "General Contract Terms",
             "embedding": None,
             "answer_strategy": """
-To answer questions about key points in a document:
-1. Identify the main sections or headings in the document
-2. Look for executive summaries, conclusions, or bullet points highlighting important information
-3. Note any recurring themes or emphasized information
-4. Identify points marked as important, critical, or essential
-5. List 3-5 of the most important takeaways from the document
+To answer questions about automatic renewal clauses:
+1. Look for sections labeled "Renewal", "Extension", "Term", or "Termination"
+2. Search for phrases like "automatically renew", "auto-renewal", or "evergreen clause"
+3. Identify the conditions for automatic renewal (if any)
+4. Note the length of the renewal periods (e.g., "renews for successive one-year terms")
+5. Look for any notification requirements to prevent automatic renewal
 """
         },
         {
             "id": 3,
-            "question_text": "How do I use this feature?",
-            "category": "Usage",
+            "question_text": "What is the termination notice period required?",
+            "category": "General Contract Terms",
             "embedding": None,
             "answer_strategy": """
-To answer questions about how to use a feature:
-1. Look for sections labeled "How to", "Usage", "Instructions", or "Getting Started"
-2. Find step-by-step instructions or numbered lists describing the process
-3. Note any prerequisites or requirements before using the feature
-4. Identify any screenshots, diagrams, or examples showing feature usage
-5. Look for tips, best practices, or common pitfalls related to the feature
+To answer questions about termination notice periods:
+1. Look for sections labeled "Termination", "Cancellation", or "Notice Requirements"
+2. Identify specific timeframes for providing notice (e.g., "30 days written notice")
+3. Note any differences in notice periods for different termination scenarios
+4. Check if notice must be delivered in a specific format (e.g., certified mail, email)
+5. Look for any special conditions related to notice periods at different contract stages
 """
         },
         {
             "id": 4,
-            "question_text": "What are the requirements for this?",
-            "category": "Requirements",
+            "question_text": "Are there any penalties for early termination?",
+            "category": "General Contract Terms",
             "embedding": None,
             "answer_strategy": """
-To answer questions about requirements:
-1. Look for sections labeled "Requirements", "Prerequisites", "Dependencies", or "System Requirements"
-2. Identify any hardware specifications mentioned
-3. Note software dependencies and version requirements
-4. Check for account permissions, API keys, or authentication requirements
-5. Look for environmental requirements (OS, browser compatibility, etc.)
+To answer questions about early termination penalties:
+1. Look for sections labeled "Early Termination", "Termination Fees", or "Liquidated Damages"
+2. Identify any financial penalties mentioned for ending the contract before its term
+3. Note if penalties vary based on when termination occurs during the contract period
+4. Check if there are exceptions where early termination is allowed without penalty
+5. Look for formulas used to calculate termination fees (e.g., percentage of remaining contract value)
 """
         },
         {
             "id": 5,
-            "question_text": "How do I troubleshoot issues with this?",
-            "category": "Troubleshooting",
+            "question_text": "Which accounts are eligible for contract benefits?",
+            "category": "General Contract Terms",
             "embedding": None,
             "answer_strategy": """
-To answer questions about troubleshooting:
-1. Look for sections labeled "Troubleshooting", "Common Issues", "FAQs", or "Known Issues"
-2. Identify specific error messages or symptoms mentioned
-3. Find step-by-step debugging processes
-4. Note any recommended tools or logs to check
-5. Look for contact information for support or further assistance
+To answer questions about account eligibility for contract benefits:
+1. Look for sections about "Eligibility", "Scope", "Coverage", or "Participating Accounts"
+2. Identify any account qualifications or requirements mentioned
+3. Note any excluded accounts or services specifically mentioned
+4. Check for language about affiliates, subsidiaries, or related entities
+5. Look for any volume or spending thresholds that determine eligibility
 """
         },
         {
             "id": 6,
-            "question_text": "What are the best practices for this?",
-            "category": "Best Practices",
+            "question_text": "Who are the parties involved in the contract?",
+            "category": "General Contract Terms",
             "embedding": None,
             "answer_strategy": """
-To answer questions about best practices:
-1. Look for sections labeled "Best Practices", "Recommendations", or "Guidelines"
-2. Note any warnings, cautions, or important notices
-3. Identify optimization tips or performance suggestions
-4. Find security recommendations or data handling practices
-5. Look for patterns that are explicitly encouraged or discouraged
+To answer questions about parties involved in the contract:
+1. Look at the beginning of the contract for a section defining the parties
+2. Check for terms like "Party A", "Party B", "Client", "Provider", "Vendor", "Customer", etc.
+3. Note the full legal names of all entities mentioned as contracting parties
+4. Look for definitions of parties' affiliates or subsidiaries that may be covered
+5. Identify any third parties referenced that have rights or obligations under the contract
 """
         },
         {
             "id": 7,
-            "question_text": "What versions are supported?",
-            "category": "Compatibility",
+            "question_text": "Are there any exclusivity clauses restricting me from using other carriers?",
+            "category": "General Contract Terms",
             "embedding": None,
             "answer_strategy": """
-To answer questions about supported versions:
-1. Look for sections about "Compatibility", "Supported Versions", or "System Requirements"
-2. Identify specific version numbers mentioned
-3. Note any deprecated or upcoming version information
-4. Check for backward compatibility statements
-5. Find any version-specific features or limitations
+To answer questions about exclusivity clauses:
+1. Look for sections labeled "Exclusivity", "Non-compete", or "Preferred Provider"
+2. Search for terms like "exclusive", "sole provider", or "minimum commitment"
+3. Identify any restrictions on working with competitors
+4. Note any volume or percentage commitments required
+5. Look for exceptions to exclusivity requirements or carve-outs for specific situations
 """
         },
         {
             "id": 8,
-            "question_text": "How do I install this?",
-            "category": "Installation",
+            "question_text": "Does the contract specify a governing law and jurisdiction for disputes?",
+            "category": "General Contract Terms",
             "embedding": None,
             "answer_strategy": """
-To answer questions about installation:
-1. Look for sections labeled "Installation", "Setup", or "Getting Started"
-2. Find step-by-step installation instructions
-3. Note any installation prerequisites or requirements
-4. Identify different installation methods if multiple are offered
-5. Look for post-installation verification steps or troubleshooting
+To answer questions about governing law and jurisdiction:
+1. Look for sections labeled "Governing Law", "Jurisdiction", "Venue", or "Dispute Resolution"
+2. Identify the specific state, province, or country whose laws govern the contract
+3. Note any specified courts or venues where disputes must be filed
+4. Check for alternative dispute resolution mechanisms (arbitration, mediation)
+5. Look for choice of law provisions that may apply different laws to different aspects of the contract
 """
         },
         {
             "id": 9,
-            "question_text": "What are the limitations of this?",
-            "category": "Limitations",
+            "question_text": "What are the key performance indicators (KPIs) outlined in the contract?",
+            "category": "General Contract Terms",
             "embedding": None,
             "answer_strategy": """
-To answer questions about limitations:
-1. Look for sections about "Limitations", "Constraints", "Known Issues", or "Restrictions"
-2. Note any explicit statements about what the system cannot do
-3. Identify performance limitations, quotas, or thresholds
-4. Check for compatibility restrictions or unsupported features
-5. Find any disclaimers or warnings about edge cases
+To answer questions about key performance indicators:
+1. Look for sections labeled "Performance Metrics", "SLAs", "KPIs", or "Service Levels"
+2. Identify specific measurable targets or thresholds mentioned
+3. Note any penalties or rewards tied to performance levels
+4. Check for reporting requirements related to performance monitoring
+5. Look for provisions about remediation processes if KPIs aren't met
 """
         },
         {
             "id": 10,
-            "question_text": "How does this compare to other solutions?",
-            "category": "Comparison",
+            "question_text": "Are there any blackout dates or service restrictions during holidays?",
+            "category": "General Contract Terms",
             "embedding": None,
             "answer_strategy": """
-To answer questions about comparisons:
-1. Look for sections labeled "Comparison", "Alternatives", or "vs. Competitors"
-2. Find tables or charts comparing features across solutions
-3. Note advantages and disadvantages mentioned
-4. Identify unique selling points or differentiators
-5. Check for use case recommendations that suggest when to use this solution vs others
+To answer questions about blackout dates or holiday restrictions:
+1. Look for sections about "Service Availability", "Blackout Periods", or "Holiday Schedule"
+2. Identify any specific dates or time periods when services may be limited
+3. Note any seasonal restrictions or capacity limitations mentioned
+4. Check for modified service levels during specific periods
+5. Look for any provisions about advance notice for service interruptions
+"""
+        },
+        {
+            "id": 11,
+            "question_text": "What is the notification period for rate changes?",
+            "category": "General Contract Terms",
+            "embedding": None,
+            "answer_strategy": """
+To answer questions about notification for rate changes:
+1. Look for sections about "Pricing", "Rate Changes", "Price Adjustments", or "Fees"
+2. Identify any specific timeframes for providing notice of rate changes
+3. Note any limits on frequency or percentage of rate increases
+4. Check for client rights upon rate changes (e.g., right to terminate)
+5. Look for any exceptions where rates can change without notice
 """
         }
     ]
