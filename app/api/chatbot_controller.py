@@ -329,10 +329,24 @@ async def api_status():
         initialization_time_elapsed = 0
         initialization_timeout = False
         
+        # Track cold start status (to help frontend decide on wait times)
+        # Assume it's a cold start if initialization started very recently
+        import time
+        current_time = time.time()
+        is_cold_start = False
+        cold_start_remaining = 0
+        
+        # Render free tier typically takes ~50 seconds for cold start
+        COLD_START_THRESHOLD = 30  # seconds since server start
+        COLD_START_DURATION = 50  # total expected cold start time
+        
         if initialization_start_time > 0:
-            import time
-            current_time = time.time()
             initialization_time_elapsed = int(current_time - initialization_start_time)
+            
+            # Check if we're in cold start period
+            if initialization_time_elapsed < COLD_START_THRESHOLD:
+                is_cold_start = True
+                cold_start_remaining = max(0, COLD_START_DURATION - initialization_time_elapsed)
             
             # Check if initialization has timed out
             if initialization_time_elapsed > MAX_INITIALIZATION_TIME:
@@ -375,6 +389,13 @@ async def api_status():
         # System is ready if embeddings are initialized OR initialization timeout occurred
         system_ready = is_embedding_initialized or initialization_timeout
         
+        # Determine wait time based on cold start and embedding status
+        wait_time = 0
+        if is_cold_start:
+            wait_time = cold_start_remaining
+        elif not system_ready:
+            wait_time = min(30, MAX_INITIALIZATION_TIME - initialization_time_elapsed)
+        
         return {
             "success": True,
             "message": "API status check completed",
@@ -383,7 +404,10 @@ async def api_status():
                 "embedding_service": embedding_status,
                 "template_cache": cache_info,
                 "ready_for_queries": system_ready,
-                "estimated_wait_time": 0 if system_ready else min(30, MAX_INITIALIZATION_TIME - initialization_time_elapsed)
+                "estimated_wait_time": wait_time,
+                "is_cold_start": is_cold_start,
+                "cold_start_remaining": cold_start_remaining,
+                "server_start_time": initialization_start_time
             }
         }
     except Exception as e:

@@ -93,34 +93,49 @@ class EmbeddingService:
             except Exception as e:
                 logger.error(f"Error saving embedding cache: {str(e)}")
     
-    def save_template_embedding(self, template_id: str, embedding: List[float]):
-        """Save a specific template embedding to the template cache file."""
-        template_cache_path = os.path.join(CACHE_DIR, "template_embeddings.json")
+    def save_template_embedding(self, template_id, embedding, force_save=False):
+        """
+        Save a template embedding to the cache file.
         
-        # Load existing template cache
-        template_cache = {}
+        Args:
+            template_id: ID of the template
+            embedding: The embedding vector
+            force_save: Whether to force writing to file immediately
+        """
+        if not self.use_cache:
+            return
+        
+        cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        template_cache_path = os.path.join(cache_dir, "template_embeddings.json")
+        
+        # Load existing cache if it exists
+        cached_embeddings = {}
         if os.path.exists(template_cache_path):
             try:
                 with open(template_cache_path, 'r') as f:
-                    template_cache = json.load(f)
+                    cached_embeddings = json.load(f)
             except Exception as e:
-                logger.error(f"Error loading template cache for saving: {str(e)}")
+                logger.error(f"Error loading template embedding cache: {str(e)}")
         
-        # Add the new template embedding
-        template_cache[template_id] = embedding
+        # Add/update the new embedding
+        cached_embeddings[str(template_id)] = embedding
         
-        # Also add to in-memory cache
-        template_key = f"template_{template_id}"
-        self._embedding_cache[template_key] = embedding
-        
-        # Save back to disk
+        # Always save to the cache file right away for templates
+        # This ensures we don't lose progress between restarts
         try:
             with open(template_cache_path, 'w') as f:
-                json.dump(template_cache, f)
+                json.dump(cached_embeddings, f)
             logger.info(f"Saved template embedding for template {template_id} to cache")
+            
+            # Log a sample of the embedding for debugging
+            sample_values = str(embedding[:5]) if embedding else "None"
+            logger.info(f"Sample embedding values: {sample_values}...")
         except Exception as e:
-            logger.error(f"Error saving template cache: {str(e)}")
+            logger.error(f"Error saving template embedding cache: {str(e)}")
         
+        return embedding
+    
     def _handle_rate_limit(self):
         """Handle rate limiting to avoid 429 errors."""
         current_time = time.time()

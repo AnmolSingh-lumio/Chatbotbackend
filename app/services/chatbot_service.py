@@ -70,15 +70,28 @@ initialization_start_time = 0
 # Maximum time to wait for initialization (in seconds)
 MAX_INITIALIZATION_TIME = 600  # 10 minutes
 
-# Safely generate template embeddings with appropriate delays
+# Flag to track if we've ever initialized embeddings (persists across cold starts)
+has_initialized_before = False
+
+# Set a global initialization start timestamp
+initialization_start_time = time.time()
+
+# Fix the initialization function to properly handle the flags
 def initialize_template_embeddings_safely():
     """
     Generate embeddings for templates if not already available and cache them.
     Use appropriate delays to avoid rate limits.
     """
-    global is_embedding_initialized, is_template_initialization_in_progress, initialization_start_time
+    global is_embedding_initialized, is_template_initialization_in_progress, initialization_start_time, has_initialized_before
     
-    if is_embedding_initialized or is_template_initialization_in_progress:
+    # Safety check - if we're already initialized, don't start again
+    if is_embedding_initialized:
+        logger.info("Templates already initialized, skipping initialization")
+        return
+    
+    # Begin initialization
+    if is_template_initialization_in_progress:
+        logger.info("Template initialization already in progress, skipping duplicate initialization")
         return
     
     is_template_initialization_in_progress = True
@@ -96,21 +109,60 @@ def initialize_template_embeddings_safely():
                 with open(TEMPLATE_CACHE_PATH, 'r') as f:
                     cached_embeddings = json.load(f)
                 logger.info(f"Loaded {len(cached_embeddings)} cached template embeddings")
+                
+                # Check if we have all the embeddings we need
+                all_templates_cached = True
+                for template in TemplateStore.templates:
+                    template_id = str(template["id"])
+                    if template_id not in cached_embeddings:
+                        all_templates_cached = False
+                        needs_embeddings = True
+                        break
+                    
+                # If all templates are already cached, just load them and finish
+                if all_templates_cached:
+                    logger.info("All template embeddings already cached, using cached values")
+                    for template in TemplateStore.templates:
+                        template_id = str(template["id"])
+                        template["embedding"] = cached_embeddings[template_id]
+                    
+                    # Mark initialization as complete
+                    is_embedding_initialized = True
+                    is_template_initialization_in_progress = False
+                    has_initialized_before = True
+                    logger.info("Template initialization completed from cache")
+                    return
             except Exception as e:
                 logger.error(f"Error loading cached template embeddings: {str(e)}")
                 cached_embeddings = {}
-        
-        # Check if we need to generate any embeddings
-        for template in TemplateStore.templates:
-            template_id = str(template["id"])
-            if template_id not in cached_embeddings:
                 needs_embeddings = True
-                break
+        else:
+            needs_embeddings = True
+            logger.info("No embedding cache found, will generate embeddings")
         
-        if needs_embeddings:
+        if not needs_embeddings:
+            # This means all templates have embeddings from the cache
+            logger.info("All templates already have embeddings, skipping generation")
+            # Update templates with cached embeddings
+            for template in TemplateStore.templates:
+                template_id = str(template["id"])
+                if template_id in cached_embeddings:
+                    template["embedding"] = cached_embeddings[template_id]
+            
+            is_embedding_initialized = True
+            has_initialized_before = True
+        elif needs_embeddings:
             logger.info("Generating embeddings for templates with proper delays")
             
+            # Track newly generated embeddings to update cache file
+            new_embeddings = {}
+            needs_cache_update = False
+            
             # Generate embeddings with significant delay between requests
+            successful_embeddings = 0
+            total_embeddings_needed = sum(1 for template in TemplateStore.templates if str(template["id"]) not in cached_embeddings)
+            logger.info(f"Need to generate {total_embeddings_needed} new embeddings")
+            
             for template in TemplateStore.templates:
                 template_id = str(template["id"])
                 
@@ -131,6 +183,11 @@ def initialize_template_embeddings_safely():
                     )
                     
                     template["embedding"] = embedding
+                    successful_embeddings += 1
+                    
+                    # Store in our new embeddings dict
+                    new_embeddings[template_id] = embedding
+                    needs_cache_update = True
                 
                     # Add a significant delay between requests to avoid rate limits
                     # This is crucial for startup when many embeddings might be generated
@@ -140,25 +197,48 @@ def initialize_template_embeddings_safely():
                     logger.error(f"Error generating embedding for template {template_id}: {str(e)}")
                     # Continue with other templates even if one fails
             
-            logger.info(f"Template embeddings generation completed successfully")
-        else:
-            # Update templates with cached embeddings
-            for template in TemplateStore.templates:
-                template_id = str(template["id"])
-                if template_id in cached_embeddings:
-                    template["embedding"] = cached_embeddings[template_id]
+            # Update cache file with new embeddings
+            if needs_cache_update:
+                try:
+                    # Merge existing cache with new embeddings
+                    cached_embeddings.update(new_embeddings)
+                    
+                    # Make sure cache directory exists
+                    os.makedirs(os.path.dirname(TEMPLATE_CACHE_PATH), exist_ok=True)
+                    
+                    # Write updated cache
+                    with open(TEMPLATE_CACHE_PATH, 'w') as f:
+                        json.dump(cached_embeddings, f)
+                    logger.info(f"Updated template embeddings cache with {len(new_embeddings)} new embeddings")
+                except Exception as e:
+                    logger.error(f"Error saving template embeddings cache: {str(e)}")
             
-            logger.info("All template embeddings already cached, using cached values")
+            # Log completion status
+            if successful_embeddings == total_embeddings_needed:
+                logger.info(f"All {successful_embeddings} template embeddings generated successfully")
+            else:
+                logger.warning(f"Generated {successful_embeddings} of {total_embeddings_needed} embeddings")
+                
+            # Mark as initialized even if some failed - we'll work with what we have
+            logger.info("Template embeddings generation completed")
         
+        # Always mark as initialized when done
         is_embedding_initialized = True
+        has_initialized_before = True
     except Exception as e:
         logger.error(f"Error initializing template embeddings: {str(e)}")
     finally:
+        # Ensure we clear the in-progress flag
         is_template_initialization_in_progress = False
-        # Double check we're really setting this to True
+        
+        # Double check we're really setting the initialized flag to True
         if not is_embedding_initialized:
             logger.warning("Embedding initialization flag was not set properly. Setting it now.")
             is_embedding_initialized = True
+            has_initialized_before = True
+        
+        # Log final initialization state
+        logger.info(f"Initialization completed. Status: initialized={is_embedding_initialized}, in_progress={is_template_initialization_in_progress}")
 
 # Start template embedding generation in a background thread on startup
 threading.Thread(target=initialize_template_embeddings_safely, daemon=True).start()
@@ -191,52 +271,40 @@ class ChatbotService:
         try:
             global is_embedding_initialized, is_template_initialization_in_progress, initialization_start_time
             
-            # Check if initialization has been running too long and force it to be ready
-            current_time = time.time()
-            if is_template_initialization_in_progress and (current_time - initialization_start_time > MAX_INITIALIZATION_TIME):
-                logger.warning(f"Embedding initialization has been running for over {MAX_INITIALIZATION_TIME} seconds. Force setting initialized flag.")
+            # Force initialization flag to true if it's been too long
+            elapsed_time = time.time() - initialization_start_time
+            if not is_embedding_initialized and elapsed_time > MAX_INITIALIZATION_TIME:
+                logger.warning(f"Force setting initialization flags after {elapsed_time:.1f} seconds")
                 is_embedding_initialized = True
                 is_template_initialization_in_progress = False
             
-            # Check if template initialization is in progress
-            if is_template_initialization_in_progress:
-                logger.info("Template embeddings are still being initialized")
-                return {
-                    "success": False,
-                    "message": "System is initializing. Please try again in a minute.",
-                    "data": {
-                        "initializing": True,
-                        "retry": True,
-                        "wait_time": 30
-                    }
-                }
+            # Calculate time since server start for cold start detection
+            server_uptime = time.time() - initialization_start_time
+            is_cold_start = server_uptime < 30  # Consider cold start if less than 30 seconds since start
             
-            # If templates aren't initialized yet, wait for them
-            if not is_embedding_initialized:
-                logger.info("Waiting for template embeddings to be initialized")
-                # Wait up to 10 seconds for initialization to complete
-                for _ in range(10):
-                    if is_embedding_initialized:
-                        break
-                    await asyncio.sleep(1)
-                
-                # If still not initialized, return a message
-                if not is_embedding_initialized:
-                    # Force initialization after too many attempts
-                    elapsed_time = time.time() - initialization_start_time
-                    if elapsed_time > MAX_INITIALIZATION_TIME:
-                        logger.warning("Initialization taking too long. Forcing initialization complete.")
-                        is_embedding_initialized = True
-                    else:
-                        return {
-                            "success": False,
-                            "message": "System is still initializing embeddings. Please try again in a minute.",
-                            "data": {
-                                "initializing": True,
-                                "retry": True,
-                                "wait_time": 30
-                            }
+            # Debug logging
+            logger.info(f"Request received. Initialized: {is_embedding_initialized}, In progress: {is_template_initialization_in_progress}, Uptime: {server_uptime:.1f}s")
+            
+            # If we're still initializing, but we'll allow requests to proceed after a timeout
+            if is_template_initialization_in_progress and not is_embedding_initialized:
+                # If we're in a cold start and it's been less than 20 seconds, tell client to wait
+                if is_cold_start and server_uptime < 20:
+                    logger.info(f"Server in cold start ({server_uptime:.1f}s), asking client to wait")
+                    return {
+                        "success": False,
+                        "message": "Server is starting up. Please try again in a moment.",
+                        "data": {
+                            "initializing": True,
+                            "retry": True,
+                            "wait_time": max(5, 30 - int(server_uptime)),
+                            "cold_start": True
                         }
+                    }
+                
+                # If it's been a while, we'll proceed anyway for better UX
+                logger.info(f"Initialization taking too long ({elapsed_time:.1f}s). Proceeding with request.")
+                is_embedding_initialized = True
+                is_template_initialization_in_progress = False
             
             # Initial validation
             if not request.question:
