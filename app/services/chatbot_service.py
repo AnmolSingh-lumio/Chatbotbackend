@@ -189,10 +189,10 @@ def initialize_template_embeddings_safely():
                     new_embeddings[template_id] = embedding
                     needs_cache_update = True
                 
-                    # Add a significant delay between requests to avoid rate limits
+                    # Add a small delay between requests to avoid rate limits
                     # This is crucial for startup when many embeddings might be generated
-                    logger.info(f"Added 10-second delay after generating template {template_id} embedding")
-                    time.sleep(10)
+                    logger.info(f"Added 2-second delay after generating template {template_id} embedding")
+                    time.sleep(2)
                 except Exception as e:
                     logger.error(f"Error generating embedding for template {template_id}: {str(e)}")
                     # Continue with other templates even if one fails
