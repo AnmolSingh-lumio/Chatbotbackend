@@ -64,18 +64,25 @@ document_embedding_cache = {}
 is_template_initialization_in_progress = False
 is_embedding_initialized = False
 
+# Timestamp to track when initialization started
+initialization_start_time = 0
+
+# Maximum time to wait for initialization (in seconds)
+MAX_INITIALIZATION_TIME = 600  # 10 minutes
+
 # Safely generate template embeddings with appropriate delays
 def initialize_template_embeddings_safely():
     """
     Generate embeddings for templates if not already available and cache them.
     Use appropriate delays to avoid rate limits.
     """
-    global is_embedding_initialized, is_template_initialization_in_progress
+    global is_embedding_initialized, is_template_initialization_in_progress, initialization_start_time
     
     if is_embedding_initialized or is_template_initialization_in_progress:
         return
     
     is_template_initialization_in_progress = True
+    initialization_start_time = time.time()
     logger.info("Starting initialization of template embeddings in background thread")
     
     try:
@@ -115,19 +122,23 @@ def initialize_template_embeddings_safely():
                 
                 # Generate embedding with template-specific parameters
                 logger.info(f"Generating embedding for template {template_id}: {template['question_text'][:50]}...")
-                embedding = embedding_service.generate_embedding(
-                    template["question_text"],
-                    task_type="SEMANTIC_SIMILARITY",
-                    is_template=True,
-                    template_id=template_id
-                )
+                try:
+                    embedding = embedding_service.generate_embedding(
+                        template["question_text"],
+                        task_type="SEMANTIC_SIMILARITY",
+                        is_template=True,
+                        template_id=template_id
+                    )
+                    
+                    template["embedding"] = embedding
                 
-                template["embedding"] = embedding
-                
-                # Add a significant delay between requests to avoid rate limits
-                # This is crucial for startup when many embeddings might be generated
-                logger.info(f"Added 10-second delay after generating template {template_id} embedding")
-                time.sleep(10)
+                    # Add a significant delay between requests to avoid rate limits
+                    # This is crucial for startup when many embeddings might be generated
+                    logger.info(f"Added 10-second delay after generating template {template_id} embedding")
+                    time.sleep(10)
+                except Exception as e:
+                    logger.error(f"Error generating embedding for template {template_id}: {str(e)}")
+                    # Continue with other templates even if one fails
             
             logger.info(f"Template embeddings generation completed successfully")
         else:
@@ -144,6 +155,10 @@ def initialize_template_embeddings_safely():
         logger.error(f"Error initializing template embeddings: {str(e)}")
     finally:
         is_template_initialization_in_progress = False
+        # Double check we're really setting this to True
+        if not is_embedding_initialized:
+            logger.warning("Embedding initialization flag was not set properly. Setting it now.")
+            is_embedding_initialized = True
 
 # Start template embedding generation in a background thread on startup
 threading.Thread(target=initialize_template_embeddings_safely, daemon=True).start()
@@ -174,7 +189,14 @@ class ChatbotService:
             Dict containing the answer and metadata
         """
         try:
-            global is_embedding_initialized, is_template_initialization_in_progress
+            global is_embedding_initialized, is_template_initialization_in_progress, initialization_start_time
+            
+            # Check if initialization has been running too long and force it to be ready
+            current_time = time.time()
+            if is_template_initialization_in_progress and (current_time - initialization_start_time > MAX_INITIALIZATION_TIME):
+                logger.warning(f"Embedding initialization has been running for over {MAX_INITIALIZATION_TIME} seconds. Force setting initialized flag.")
+                is_embedding_initialized = True
+                is_template_initialization_in_progress = False
             
             # Check if template initialization is in progress
             if is_template_initialization_in_progress:
@@ -183,7 +205,9 @@ class ChatbotService:
                     "success": False,
                     "message": "System is initializing. Please try again in a minute.",
                     "data": {
-                        "initializing": True
+                        "initializing": True,
+                        "retry": True,
+                        "wait_time": 30
                     }
                 }
             
@@ -198,13 +222,21 @@ class ChatbotService:
                 
                 # If still not initialized, return a message
                 if not is_embedding_initialized:
-                    return {
-                        "success": False,
-                        "message": "System is still initializing embeddings. Please try again in a minute.",
-                        "data": {
-                            "initializing": True
+                    # Force initialization after too many attempts
+                    elapsed_time = time.time() - initialization_start_time
+                    if elapsed_time > MAX_INITIALIZATION_TIME:
+                        logger.warning("Initialization taking too long. Forcing initialization complete.")
+                        is_embedding_initialized = True
+                    else:
+                        return {
+                            "success": False,
+                            "message": "System is still initializing embeddings. Please try again in a minute.",
+                            "data": {
+                                "initializing": True,
+                                "retry": True,
+                                "wait_time": 30
+                            }
                         }
-                    }
             
             # Initial validation
             if not request.question:
@@ -250,8 +282,11 @@ class ChatbotService:
                         logger.error(f"Failed to initialize Gemini model: {str(e)}")
                         return {
                             "success": False,
-                            "message": f"Failed to initialize Gemini model: {str(e)}",
-                            "data": None
+                            "message": "Failed to initialize Gemini model",
+                            "data": {
+                                "error": str(e),
+                                "retry": True
+                            }
                         }
             
             # Check if we recently hit a rate limit and should wait
