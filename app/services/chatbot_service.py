@@ -370,28 +370,28 @@ class ChatbotService:
                     }
                 }
             
-            # Create the prompt - optimize token usage for fewer rate limits
+            # Create the prompt - use full document with higher tier
             prompt = f"""
-You are an AI assistant tasked with answering questions about the following document. 
-Answer concisely based ONLY on information found in the document.
-If the information cannot be found, state "This information is not provided in the document."
+You are an AI assistant tasked with answering questions about the following contract document. 
+Answer thoroughly based ONLY on information found in the document.
+If the information cannot be found, state "This information is not provided in the contract."
 
-Document:
-{request.markdown_content[:20000]}  # Limit document size to first 20k chars to reduce tokens
+Contract Document:
+{request.markdown_content}
 
 Question: {request.question}
 """
 
             logger.info(f"Processing question: {request.question[:50]}... (document length: {len(request.markdown_content)} chars)")
-            logger.info(f"Truncated document to first 20k chars to reduce token usage and avoid rate limits")
+            logger.info(f"Using full document content as we're on higher tier with increased quota limits")
             
             # Generate response with retry logic
             for attempt in range(cls._max_retries + 1):
                 try:
-                    # Configure the model to be more concise
+                    # Configure the model 
                     generation_params = {
                         "temperature": 0.1,
-                        "max_output_tokens": 1024,  # Reduced from 2048
+                        "max_output_tokens": 2048,  # Increased back to full capacity
                         "top_p": 0.95,
                         "top_k": 40,
                     }

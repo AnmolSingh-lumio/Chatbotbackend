@@ -36,6 +36,8 @@
     "PYTHONPATH": ".",
     "ENVIRONMENT": "production",
     "PYTHONUNBUFFERED": "1",
-    "WORKER_TIMEOUT": "120"
+    "WORKER_TIMEOUT": "300",
+    "USE_HIGHER_TIER": "true",
+    "MAX_DOCUMENT_SIZE": "200000"
   }
 } 

@@ -1,8 +1,12 @@
+"""Main FastAPI application entry point."""
+
+# Importing required FastAPI components
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import logging
 from dotenv import load_dotenv
+import sys
 
 # Initialize Logger
 logger = logging.getLogger(__name__)
@@ -18,12 +22,14 @@ def create_app() -> FastAPI:
     """Creates and configures the FastAPI application."""
     logger.debug("Creating Chatbot Backend API...")
 
+    # Initialize FastAPI app with increased timeout for large documents
     app = FastAPI(
         title="Chatbot Q&A API",
         description="API for chatbot Q&A functionality with markdown documents",
         version="1.0.0",
         docs_url="/api/docs",
         redoc_url="/api/redoc",
+        timeout=300
     )
 
     # CORS Middleware - Allow all origins
