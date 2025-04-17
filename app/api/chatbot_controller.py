@@ -322,13 +322,29 @@ async def api_status():
     """
     Status endpoint to check if the API is ready for use.
     """
-    from app.services.chatbot_service import is_embedding_initialized, is_template_initialization_in_progress
+    from app.services.chatbot_service import is_embedding_initialized, is_template_initialization_in_progress, initialization_start_time, MAX_INITIALIZATION_TIME
     
     try:
+        # Calculate how long initialization has been running
+        initialization_time_elapsed = 0
+        initialization_timeout = False
+        
+        if initialization_start_time > 0:
+            import time
+            current_time = time.time()
+            initialization_time_elapsed = int(current_time - initialization_start_time)
+            
+            # Check if initialization has timed out
+            if initialization_time_elapsed > MAX_INITIALIZATION_TIME:
+                initialization_timeout = True
+        
         # Get embedding initialization status
         embedding_status = {
             "initialized": is_embedding_initialized,
-            "initialization_in_progress": is_template_initialization_in_progress
+            "initialization_in_progress": is_template_initialization_in_progress,
+            "initialization_time_elapsed": initialization_time_elapsed,
+            "initialization_timeout": initialization_timeout,
+            "max_initialization_time": MAX_INITIALIZATION_TIME
         }
         
         # Check if template embedding cache exists
@@ -356,6 +372,9 @@ async def api_status():
                 "exists": False
             }
         
+        # System is ready if embeddings are initialized OR initialization timeout occurred
+        system_ready = is_embedding_initialized or initialization_timeout
+        
         return {
             "success": True,
             "message": "API status check completed",
@@ -363,7 +382,8 @@ async def api_status():
                 "api_online": True,
                 "embedding_service": embedding_status,
                 "template_cache": cache_info,
-                "ready_for_queries": is_embedding_initialized and not is_template_initialization_in_progress
+                "ready_for_queries": system_ready,
+                "estimated_wait_time": 0 if system_ready else min(30, MAX_INITIALIZATION_TIME - initialization_time_elapsed)
             }
         }
     except Exception as e:
