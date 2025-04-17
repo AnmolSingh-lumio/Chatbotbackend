@@ -370,25 +370,37 @@ class ChatbotService:
                     }
                 }
             
-            # Create the prompt
+            # Create the prompt - optimize token usage for fewer rate limits
             prompt = f"""
-            You are an AI assistant tasked with answering questions about the following document. 
-            Only answer questions based on information found in the document.
-            If the information cannot be found in the document, please state that clearly.
-            
-            Document:
-            {request.markdown_content}
-            
-            Question: {request.question}
-            """
-            
-            logger.info(f"Processing question: {request.question[:50]}...")
+You are an AI assistant tasked with answering questions about the following document. 
+Answer concisely based ONLY on information found in the document.
+If the information cannot be found, state "This information is not provided in the document."
+
+Document:
+{request.markdown_content[:20000]}  # Limit document size to first 20k chars to reduce tokens
+
+Question: {request.question}
+"""
+
+            logger.info(f"Processing question: {request.question[:50]}... (document length: {len(request.markdown_content)} chars)")
+            logger.info(f"Truncated document to first 20k chars to reduce token usage and avoid rate limits")
             
             # Generate response with retry logic
             for attempt in range(cls._max_retries + 1):
                 try:
+                    # Configure the model to be more concise
+                    generation_params = {
+                        "temperature": 0.1,
+                        "max_output_tokens": 1024,  # Reduced from 2048
+                        "top_p": 0.95,
+                        "top_k": 40,
+                    }
+                    
                     # Generate response
-                    response = cls._model.generate_content(prompt)
+                    response = cls._model.generate_content(
+                        prompt,
+                        generation_config=generation_params
+                    )
                     
                     # Reset rate limit flag if successful
                     cls._rate_limit_hit = False

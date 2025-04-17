@@ -40,6 +40,9 @@ class EmbeddingService:
         self.last_request_time = time.time()
         self.max_requests_per_minute = 15  # Google's limit is 15 RPM/TPM
         
+        # Set caching option - default to enabled
+        self.use_cache = True
+        
         # In-memory embedding cache
         self._embedding_cache = {}
         
@@ -102,9 +105,7 @@ class EmbeddingService:
             embedding: The embedding vector
             force_save: Whether to force writing to file immediately
         """
-        if not self.use_cache:
-            return
-        
+        # Always save template embeddings regardless of cache setting
         cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cache")
         os.makedirs(cache_dir, exist_ok=True)
         template_cache_path = os.path.join(cache_dir, "template_embeddings.json")
