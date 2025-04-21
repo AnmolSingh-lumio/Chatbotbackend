@@ -37,16 +37,26 @@ class VectorRepository:
         elif "render.com" in database_url and "sslmode" not in database_url:
             database_url += "?sslmode=require"
         
-        # Initialize PGVector with correct settings
-        self.vector_store = PGVector(
-            collection_name="document_chunks",
-            connection=database_url,
-            embeddings=self.embeddings,
-            use_jsonb=True,
-            connection_args={
-                "ssl": "require" if "render.com" in database_url else None
-            }
-        )
+        try:
+            # Initialize PGVector with correct settings for the current version
+            # Removing connection_args parameter which is not supported
+            self.vector_store = PGVector(
+                collection_name="document_chunks",
+                connection=database_url,
+                embeddings=self.embeddings,
+                use_jsonb=True
+            )
+            logger.info("PGVector initialized successfully")
+        except TypeError as e:
+            # If there's a parameter error, try with fewer parameters
+            logger.error(f"Error initializing PGVector: {str(e)}")
+            logger.info("Trying with minimal parameters")
+            self.vector_store = PGVector(
+                collection_name="document_chunks",
+                connection=database_url,
+                embeddings=self.embeddings
+            )
+            logger.info("PGVector initialized with minimal parameters")
         
         logger.info("Vector repository initialized")
     
