@@ -31,63 +31,103 @@ class ChatbotService:
     
     def __init__(self):
         """Initialize the chatbot service."""
-        # Get OpenAI API key
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not self.openai_api_key:
             logger.error("OPENAI_API_KEY not found in environment variables")
-            raise ValueError("OPENAI_API_KEY not found in environment variables")
+            raise ValueError("OPENAI_API_KEY not found")
             
-        # Initialize OpenAI client - Simple initialization for older version
-        try:
-            self.client = OpenAI(api_key=self.api_key)
-            logger.info("OpenAI client initialized successfully")
-        except TypeError as e:
-            logger.error(f"Error initializing OpenAI client: {str(e)}")
-            # Fallback with bare minimum parameters
-            logger.info("Trying fallback initialization")
-            self.client = OpenAI()
-            self.client.api_key = self.api_key
+        # Initialize client
+        self.client = OpenAI(api_key=self.openai_api_key)
+        self.model_name = os.getenv("OPENAI_MODEL", "gpt-4o")
+        logger.info(f"Using OpenAI model: {self.model_name}")
         
-        # Get LLM model name
-        self.model_name = os.getenv("MODEL_NAME", "gpt-4o")
-        
-        # Create helper services
+        # Initialize supporting services
+        self.chunking_service = ChunkingService()
         self.embedding_service = EmbeddingService()
         self.vector_repository = VectorRepository()
-        self.chunking_service = ChunkingService()
         
-        # Make initialization variables available
-        global is_initialized, initialization_time
-        self.is_initialized = is_initialized
-        self.initialization_time = initialization_time
+        # Track service initialization state
+        self.is_initialized = False
+        self.is_initializing = False
+        self.service_start_time = time.time()
+        
+    async def initialize(self):
+        """Initialize the chatbot service during application startup."""
+        if self.is_initialized or self.is_initializing:
+            logger.info("ChatbotService initialization already in progress or completed")
+            return
+        
+        try:
+            self.is_initializing = True
+            logger.info("Initializing ChatbotService...")
+            
+            # Test connection to OpenAI API
+            test_response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "Respond with OK to test the connection."}
+                ],
+                max_tokens=10
+            )
+            
+            logger.info(f"OpenAI API connection test successful: {test_response.choices[0].message.content}")
+            
+            # Initialize template store with embeddings if needed
+            # from app.services.template_store import TemplateStore
+            # TemplateStore.generate_embeddings(self.embedding_service)
+            
+            self.is_initialized = True
+            logger.info("ChatbotService initialization complete")
+            
+        except Exception as e:
+            logger.error(f"Error initializing ChatbotService: {str(e)}", exc_info=True)
+            self.is_initializing = False
+            raise
+        finally:
+            self.is_initializing = False
         
     async def process_upload(
         self, 
         db: AsyncSession, 
         filename: str, 
         content: str, 
-        description: Optional[str] = None
+        description: Optional[str] = None,
+        reindex: bool = False
     ) -> Dict[str, Any]:
         """
-        Process an uploaded document by chunking and storing with embeddings.
+        Process an uploaded markdown document by chunking and generating embeddings.
         
         Args:
             db: Database session
-            filename: Name of the document file
-            content: Content of the document
+            filename: Filename of the document
+            content: Text content of the document
             description: Optional description of the document
+            reindex: Whether this is a reindexing operation rather than a new upload
             
         Returns:
-            Dictionary with document information
+            Dictionary with processing results
         """
+        logger.info(f"Processing upload for document: {filename}")
+        
         try:
-            logger.info(f"Processing upload for document: {filename}")
+            # Check if document already exists (except during reindexing)
+            if not reindex:
+                existing_doc = await self.vector_repository.get_document_by_filename(db, filename)
+                if existing_doc:
+                    # Delete existing document first if it exists
+                    logger.info(f"Document {filename} already exists, deleting it first")
+                    await self.vector_repository.delete_document(db, filename)
+            else:
+                # For reindexing, always delete the existing document
+                logger.info(f"Reindexing document {filename}, removing old version first")
+                await self.vector_repository.delete_document(db, filename)
             
-            # Chunk the document
+            # Split content into chunks
             chunks = self.chunking_service.chunk_markdown(content)
             logger.info(f"Document chunked into {len(chunks)} pieces")
             
-            # Store document and chunks with embeddings
+            # Store document and chunks in vector database
             document_id = await self.vector_repository.store_document(
                 db=db,
                 filename=filename,
@@ -96,19 +136,27 @@ class ChatbotService:
                 description=description
             )
             
-            # Return document information
+            if reindex:
+                logger.info(f"Successfully reindexed document {filename} with ID {document_id}")
+            else:
+                logger.info(f"Successfully processed document {filename} with ID {document_id}")
+            
+            # Add a processing delay to let vector store operations complete before querying
+            processing_delay = 1.0
+            await asyncio.sleep(processing_delay)
+            
             return {
                 "success": True,
                 "message": "Document processed successfully",
                 "data": {
-                    "document_id": document_id,
                     "filename": filename,
-                    "chunks": len(chunks)
+                    "chunks": len(chunks),
+                    "document_id": document_id
                 }
             }
             
         except Exception as e:
-            logger.error(f"Error processing document upload: {str(e)}")
+            logger.error(f"Error processing document: {str(e)}", exc_info=True)
             return {
                 "success": False,
                 "message": f"Error processing document: {str(e)}",
@@ -138,6 +186,7 @@ class ChatbotService:
         """
         start_time = time.time()
         logger.info(f"Processing question: {question}")
+        logger.info(f"Document context - ID: {document_id}, Filename: {filename}")
         
         # Check if we're still initializing
         global is_initialized, initialization_time
@@ -172,6 +221,13 @@ class ChatbotService:
                     "data": None
                 }
         
+        # Get document info for context
+        document_info = None
+        if document_id:
+            document_info = await self.vector_repository.get_document_by_id(db, document_id)
+        elif filename:
+            document_info = await self.vector_repository.get_document_by_filename(db, filename)
+            
         # Log document length for context
         if filename:
             doc = await self.vector_repository.get_document_by_filename(db, filename)
@@ -188,7 +244,11 @@ class ChatbotService:
         
         try:
             # Prepare chat messages with system prompt and history
-            messages = self._prepare_chat_messages(question, chat_history)
+            messages = self._prepare_chat_messages(
+                question=question, 
+                chat_history=chat_history,
+                document_info=document_info
+            )
             
             # Define tools for function calling
             tools = [
@@ -272,13 +332,21 @@ class ChatbotService:
                     # Execute the appropriate function
                     if function_name == "retrieve_document_chunks":
                         # Get similar chunks for the query
+                        query = function_args.get("query", question)
+                        
+                        # Keep search general without query-specific enhancements
                         chunks = await self.vector_repository.search_similar_chunks(
                             db=db,
-                            query=function_args.get("query", question),
+                            query=query,
                             limit=function_args.get("limit", 5),
                             document_id=document_id
                         )
                         result = chunks
+                        
+                        # Log which document we're searching in
+                        if document_id:
+                            logger.info(f"Retrieving chunks specifically for document ID: {document_id}")
+                        
                         all_used_contexts.extend([chunk["content"] for chunk in chunks])
                         
                     elif function_name == "get_document_metadata":
@@ -365,7 +433,8 @@ class ChatbotService:
     def _prepare_chat_messages(
         self, 
         question: str, 
-        chat_history: Optional[List[Dict[str, Any]]] = None
+        chat_history: Optional[List[Dict[str, Any]]] = None,
+        document_info: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """
         Prepare chat messages with system prompt and history.
@@ -373,27 +442,41 @@ class ChatbotService:
         Args:
             question: The current question
             chat_history: List of previous chat messages
+            document_info: Information about the current document being queried
             
         Returns:
             List of messages for OpenAI API
         """
+        # Create document context string
+        document_context = ""
+        if document_info:
+            document_context = f"""
+            CURRENT DOCUMENT CONTEXT:
+            Filename: {document_info.get('filename', 'Unknown')}
+            Document ID: {document_info.get('id', 'Unknown')}
+            
+            You are analyzing this specific document. All answers should be based on this document's content.
+            """
+        
         # System prompt for the chatbot
-        system_prompt = """
+        system_prompt = f"""
         You are a Contract Analysis Chatbot specialized in analyzing legal documents and contracts.
         
+        {document_context}
+        
         Your task is to:
-        1. Use the available tools to retrieve relevant information from the contract documents
-        2. Analyze the contract sections and clauses to understand their meaning and implications
-        3. Provide accurate, helpful answers based solely on the contract content
-        4. If you don't have enough information in the document, say so rather than making up answers
-        5. Always prioritize information from the document over general knowledge
+        1. Only provide information that is explicitly found in the CURRENT document being analyzed
+        2. NEVER mix information between different contracts - each contract is a separate document
+        3. Each question refers to a specific contract indicated in the interface - maintain strict document context
+        4. If the current document doesn't contain the specific information requested, clearly state this
+        5. When using content from documents, be precise and cite sections/clauses where possible
         
         Guidelines:
-        - Stay focused on the contract content when answering questions
-        - Provide specific information and cite relevant clauses and sections
-        - Be accurate when explaining legal terms and obligations found in the contract
-        - If multiple interpretations are possible, explain the different perspectives
-        - Be concise but comprehensive in your responses
+        - Your answers should be specific to only the current document being queried
+        - Do not apply information from one contract to another, even if they appear similar
+        - Be precise: if dates, parties, or specifics differ between contracts, reflect those differences
+        - If you can't find relevant information in the current document chunks, say so directly
+        - When providing answers, include the document name/ID to clarify which document you're referencing
         """
         
         # Initialize messages with system prompt

@@ -65,11 +65,26 @@ async def ask_question(
     try:
         logger.info(f"Received Q&A request with question: {request.question}")
         
+        document_id = request.document_id
+        filename = request.filename
+        
+        # If filename is provided but no document_id, fetch document_id first
+        if filename and not document_id:
+            logger.info(f"Looking up document ID for filename: {filename}")
+            doc = await vector_repository.get_document_by_filename(db, filename)
+            if doc:
+                document_id = doc["id"]
+                logger.info(f"Found document ID: {document_id} for filename: {filename} - WILL USE THIS DOCUMENT CONTEXT")
+            else:
+                logger.warning(f"Filename {filename} not found in database")
+                
         # Use the chatbot service to answer the question
         response = await chatbot_service.answer_question(
             db=db, 
             question=request.question,
-            filename=request.filename
+            filename=filename,
+            document_id=document_id,
+            chat_history=request.chat_history
         )
         
         if not response["success"]:

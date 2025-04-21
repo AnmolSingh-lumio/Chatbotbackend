@@ -42,24 +42,38 @@ class ChunkingService:
         for section_title, section_content in sections:
             # If section is smaller than chunk size, use it as is
             if len(section_content) <= self.chunk_size:
+                # Extract and add contract-specific metadata
+                section_metadata = self._extract_contract_metadata(section_content, section_title)
+                
                 chunks.append({
                     "content": section_content,
                     "metadata": {
                         "section": section_title,
                         "start_char": 0,
-                        "end_char": len(section_content)
+                        "end_char": len(section_content),
+                        **section_metadata  # Add contract-specific metadata
                     }
                 })
             else:
                 # If section is larger than chunk size, split by paragraphs
                 section_chunks = self._chunk_text(section_content)
+                
+                # Extract metadata from the whole section
+                section_metadata = self._extract_contract_metadata(section_content, section_title)
+                
                 for i, chunk in enumerate(section_chunks):
+                    # For each chunk, also check if it contains any contract metadata
+                    chunk_metadata = self._extract_contract_metadata(chunk, section_title)
+                    # Merge section metadata with any chunk-specific metadata
+                    merged_metadata = {**section_metadata, **chunk_metadata}
+                    
                     chunks.append({
                         "content": chunk,
                         "metadata": {
                             "section": section_title,
                             "chunk_index": i,
-                            "total_chunks": len(section_chunks)
+                            "total_chunks": len(section_chunks),
+                            **merged_metadata  # Add all extracted metadata
                         }
                     })
         
@@ -228,4 +242,79 @@ class ChunkingService:
                 overlap_text = previous_chunk[-self.chunk_overlap:] if len(previous_chunk) > self.chunk_overlap else previous_chunk
                 result.append(overlap_text + chunks[i])
                 
-        return result 
+        return result
+    
+    def _extract_contract_metadata(self, content: str, section_title: str) -> Dict[str, Any]:
+        """
+        Extract important metadata from document content.
+        
+        Args:
+            content: The text content
+            section_title: The title of the section
+            
+        Returns:
+            Dictionary of extracted metadata
+        """
+        metadata = {}
+        
+        # Convert to lowercase for easier matching
+        content_lower = content.lower()
+        section_lower = section_title.lower()
+        
+        # Extract dates mentioned in the text (useful for many document types)
+        import re
+        
+        # Pattern for dates in various formats - consolidated for better readability
+        date_pattern = r'(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})|([a-zA-Z]+)\s+(\d{1,2})(st|nd|rd|th)?,\s+(\d{4})|(\d{1,2})(st|nd|rd|th)?\s+([a-zA-Z]+),?\s+(\d{4})'
+        date_matches = re.findall(date_pattern, content_lower)
+        
+        if date_matches:
+            metadata["has_dates"] = True
+            metadata["date_count"] = len(date_matches)
+        
+        # Extract monetary amounts
+        money_pattern = r'\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
+        money_matches = re.findall(money_pattern, content)
+        
+        if money_matches:
+            metadata["has_monetary_amounts"] = True
+            metadata["monetary_count"] = len(money_matches)
+        
+        # Extract section type based on content analysis
+        # We'll use a more general approach that works for many document types
+        section_types = {
+            "header": ["title", "header", "subject", "regarding", "re:"],
+            "summary": ["summary", "abstract", "overview", "introduction"],
+            "key_points": ["key", "important", "critical", "essential"],
+            "description": ["description", "details", "information"],
+            "requirements": ["requirements", "must", "shall", "required"],
+            "dates": ["date", "time", "period", "duration", "term"],
+            "financial": ["payment", "cost", "price", "fee", "amount", "dollar"],
+            "parties": ["party", "person", "company", "corporation", "entity"],
+            "legal": ["law", "legal", "jurisdiction", "court", "attorney"],
+            "conditions": ["condition", "subject to", "dependent", "if", "when"],
+            "closure": ["conclusion", "finally", "in summary", "to conclude"],
+            "signatures": ["signature", "signed", "executed", "agreed"]
+        }
+        
+        # Find matching section types
+        for section_type, keywords in section_types.items():
+            keyword_count = sum(content_lower.count(keyword) for keyword in keywords)
+            if keyword_count > 0 or any(keyword in section_lower for keyword in keywords):
+                metadata["section_type"] = section_type
+                break
+        
+        # Extract named entities (names, organizations, locations) - simplified method
+        name_patterns = [
+            r'([A-Z][a-z]+\s+[A-Z][a-z]+)', # Simple name pattern (FirstName LastName)
+            r'([A-Z][a-zA-Z]*\s+Inc\.?|LLC|Corp\.?|Corporation|Company)', # Company names
+            r'University\s+of\s+[A-Z][a-zA-Z]+', # Universities
+        ]
+        
+        for pattern in name_patterns:
+            entity_matches = re.findall(pattern, content)
+            if entity_matches:
+                metadata["has_named_entities"] = True
+                break
+        
+        return metadata 

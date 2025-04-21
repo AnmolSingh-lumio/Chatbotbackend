@@ -117,25 +117,95 @@ class VectorRepository:
         limit: int = 5,
         document_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """Search for chunks similar to the query."""
-        logger.info(f"Searching for chunks similar to: {query}")
+        """
+        Search for chunks similar to the query.
         
+        Args:
+            db: Database session
+            query: The search query
+            limit: Maximum number of results to return
+            document_id: Optional document ID to filter by
+            
+        Returns:
+            List of chunks similar to the query
+        """
         try:
-            # Build filter criteria - don't convert to string!
-            filter_criteria = {}
+            logger.info(f"Searching for chunks similar to: {query}")
+            
+            # If document_id is provided, filter by it
             if document_id is not None:
                 logger.info(f"Filtering for document_id: {document_id} (type: {type(document_id)})")
-                filter_criteria["document_id"] = document_id  # Keep as integer, don't convert to string
                 
-            # Use LangChain's similarity search - try without MMR first for simplicity
-            results = self.vector_store.similarity_search_with_score(
-                query=query,
-                k=limit,
-                filter=filter_criteria if filter_criteria else None
-            )
-            
-            # Log raw results
-            logger.info(f"Raw search returned {len(results)} results")
+                # Get document to confirm it exists
+                doc_info = await self.get_document_by_id(db, document_id)
+                if not doc_info:
+                    logger.warning(f"Document with ID {document_id} not found")
+                    return []
+                
+                logger.info(f"Searching in document: {doc_info.get('filename')}")
+                
+                # HYBRID SEARCH IMPLEMENTATION
+                # 1. Perform vector similarity search
+                vector_results = []
+                try:
+                    vector_results = self.vector_store.similarity_search_with_score(
+                        query=query,
+                        k=limit,
+                        filter={"document_id": document_id}
+                    )
+                except Exception as e:
+                    logger.warning(f"Vector search failed, falling back to keyword search: {str(e)}")
+                
+                # 2. Perform keyword search on the full document content
+                keywords = self._extract_keywords(query)
+                keyword_chunks = []
+                
+                if keywords:
+                    logger.info(f"Performing keyword search with terms: {keywords}")
+                    document_content = doc_info.get('content', '')
+                    
+                    # Create chunks from sections matching keywords
+                    sections = self._split_by_headers(document_content)
+                    for section_title, section_content in sections:
+                        # Check if any keyword is in this section
+                        if any(keyword.lower() in section_content.lower() for keyword in keywords):
+                            keyword_chunks.append({
+                                "content": section_content,
+                                "metadata": {
+                                    "section": section_title,
+                                    "document_id": document_id,
+                                    "filename": doc_info.get('filename'),
+                                    "source": "keyword_search"
+                                },
+                                "score": 0.8  # Assign a default score for keyword matches
+                            })
+                
+                # 3. Combine and deduplicate results
+                results = vector_results
+                logger.info(f"Raw search returned {len(results)} results")
+                
+                # If vector search found nothing, use keyword results
+                if not results and keyword_chunks:
+                    logger.info(f"Using {len(keyword_chunks)} results from keyword search")
+                    # Convert keyword chunks to the same format as vector search results
+                    for chunk in keyword_chunks[:limit]:
+                        results.append((
+                            LangchainDocument(  # Use LangchainDocument instead of Document
+                                page_content=chunk["content"],
+                                metadata={
+                                    "section": chunk["metadata"]["section"],
+                                    "document_id": document_id,
+                                    "filename": doc_info.get('filename')
+                                }
+                            ),
+                            0.2  # Lower score means higher similarity in this API
+                        ))
+            else:
+                # If no document_id, just use vector search across all documents
+                results = self.vector_store.similarity_search_with_score(
+                    query=query,
+                    k=limit
+                )
             
             # Format results
             chunks = []
@@ -155,6 +225,24 @@ class VectorRepository:
                     "similarity": 1.0 - score
                 }
                 chunks.append(chunk)
+            
+            # If no results and we have a document ID, try to get at least the document info
+            if not chunks and document_id:
+                doc_info = await self.get_document_by_id(db, document_id)
+                if doc_info:
+                    logger.warning(f"No chunks found, but document exists: {doc_info.get('filename')}")
+                    # Create a fallback chunk with the document title as a last resort
+                    chunks.append({
+                        "id": 0,
+                        "content": f"Document: {doc_info.get('filename')}. Please try reformulating your query.",
+                        "metadata": {
+                            "section": "Document",
+                            "chunk_index": 0
+                        },
+                        "filename": doc_info.get('filename'),
+                        "document_id": document_id,
+                        "similarity": 0.5
+                    })
             
             logger.info(f"Found {len(chunks)} similar chunks")
             return chunks
@@ -194,7 +282,70 @@ class VectorRepository:
                     logger.error(f"Fallback search failed: {str(inner_e)}")
                     
             return []
+    
+    def _extract_keywords(self, query: str) -> List[str]:
+        """Extract important keywords from the query"""
+        # Remove common words and keep only significant terms
+        common_words = {"the", "a", "an", "in", "on", "at", "is", "are", "what", "who", "where", "when", "why", "how", "and", "or", "but", "of", "for", "with", "does", "do", "has", "have", "had"}
+        words = query.lower().split()
         
+        # Keep only significant terms (non-common words with at least 3 characters)
+        keywords = [word for word in words if word not in common_words and len(word) > 2]
+        
+        # Remove any remaining punctuation marks from keywords
+        keywords = [word.strip(".,;:?!()\"'") for word in keywords]
+        
+        # Remove empty strings after cleaning
+        keywords = [word for word in keywords if word]
+        
+        # If we end up with no keywords, use the most significant words from the original query
+        if not keywords and words:
+            # Sort words by length (longer words tend to be more significant)
+            sorted_words = sorted(words, key=len, reverse=True)
+            # Take up to 3 of the longest words
+            keywords = [word for word in sorted_words[:3] if len(word) > 2]
+        
+        logger.info(f"Extracted keywords from query: {keywords}")
+        return keywords
+    
+    def _split_by_headers(self, content: str) -> List[tuple]:
+        """Split content by headers for keyword search"""
+        import re
+        
+        # Find all headers (# Header)
+        header_pattern = r'^(#+)\s+(.+?)$'
+        
+        # Split content by headers
+        lines = content.split('\n')
+        sections = []
+        current_header = "Document"
+        current_content = []
+        
+        for line in lines:
+            # Check if line is a header
+            match = re.match(header_pattern, line, re.MULTILINE)
+            if match:
+                # Save previous section if there's content
+                if current_content:
+                    sections.append((current_header, '\n'.join(current_content)))
+                    current_content = []
+                
+                # Start new section
+                current_header = match.group(2)
+                current_content = [line]  # Include the header in the content
+            else:
+                current_content.append(line)
+        
+        # Add the last section
+        if current_content:
+            sections.append((current_header, '\n'.join(current_content)))
+        
+        # If no headers were found, return the entire document as one section
+        if len(sections) == 0:
+            sections.append(("Document", content))
+            
+        return sections
+    
     async def get_document_by_filename(
         self, 
         db: AsyncSession, 
@@ -283,3 +434,33 @@ class VectorRepository:
         
         logger.info(f"Successfully deleted document: {filename}")
         return True
+    
+    async def get_document_by_id(
+        self, 
+        db: AsyncSession, 
+        document_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """Get a document by ID."""
+        logger.info(f"Getting document by ID: {document_id}")
+        
+        # Use SQLAlchemy to get the document
+        result = await db.execute(
+            select(Document).where(Document.id == document_id)
+        )
+        document = result.scalars().first()
+        
+        if not document:
+            logger.warning(f"Document not found with ID: {document_id}")
+            return None
+        
+        # Convert to dictionary
+        document_dict = {
+            "id": document.id,
+            "filename": document.filename,
+            "description": document.description,
+            "content": document.content,
+            "created_at": document.created_at,
+            "updated_at": document.updated_at
+        }
+        
+        return document_dict
