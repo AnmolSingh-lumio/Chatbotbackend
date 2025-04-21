@@ -1,19 +1,22 @@
+# Render Blueprint config
 services:
   - type: web
-    name: chatbot-backend
+    name: contractchatbot
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 300 --graceful-timeout 300 --keep-alive 5
+    buildCommand: pip install -r requirements.txt && python migrations/enable_pgvector.py
+    startCommand: gunicorn main:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout 120 --bind 0.0.0.0:$PORT
+    plan: free
+    healthCheckPath: /api/health
     envVars:
-      - key: PYTHONPATH
-        value: .
+      - key: OPENAI_API_KEY
+        sync: false
       - key: ENVIRONMENT
         value: production
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_KEY
-        sync: false
-      - key: PYTHON_VERSION
-        value: 3.11.1 
+      - key: DATABASE_URL
+        fromDatabase:
+          name: chatbotdb_q346
+          property: connectionString
+
+databases:
+  - name: chatbotdb_q346
+    plan: free 

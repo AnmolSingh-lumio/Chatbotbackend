@@ -1,14 +1,23 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Response
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form, Response, Depends
+from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 from app.models.qa_request import QARequest
 from app.models.qa_response import QAResponse
-from app.services.chatbot_service import ChatbotService
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.database import get_async_db
 import os
 from typing import List, Optional
 import aiofiles
-import google.generativeai as genai
 import asyncio
 import json
+from datetime import datetime
+import time
+
+# Services
+from app.services.chatbot_service import ChatbotService
+from app.services.vector_repository import VectorRepository
+from app.services.chunking_service import ChunkingService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -16,6 +25,11 @@ logger = logging.getLogger(__name__)
 # Directory to store uploaded markdown files
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Create services
+chatbot_service = ChatbotService()
+vector_repository = VectorRepository()
+chunking_service = ChunkingService()
 
 # Check if we're in production environment
 IS_PRODUCTION = os.getenv("ENVIRONMENT") == "production"
@@ -37,21 +51,26 @@ async def options_route(rest_of_path: str):
             summary="Ask questions about a markdown document", 
             response_model=QAResponse)
 async def ask_question(
-    request: QARequest
+    request: QARequest,
+    db: AsyncSession = Depends(get_async_db)
 ):
     """
     Endpoint to ask questions about a markdown document.
     
     This endpoint:
     1. Validates the request
-    2. Processes the question using RAG (with optional embeddings)
+    2. Processes the question using RAG with function calling
     3. Returns the answer with relevant metadata
     """
     try:
         logger.info(f"Received Q&A request with question: {request.question}")
         
         # Use the chatbot service to answer the question
-        response = await ChatbotService.answer_question(request)
+        response = await chatbot_service.answer_question(
+            db=db, 
+            question=request.question,
+            filename=request.filename
+        )
         
         if not response["success"]:
             raise HTTPException(
@@ -73,6 +92,240 @@ async def ask_question(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error"
         )
+
+@router.get("/files",
+            summary="List uploaded markdown files",
+            description="Get a list of all uploaded markdown files")
+async def list_files(db: AsyncSession = Depends(get_async_db)):
+    """
+    Endpoint to list all uploaded markdown files.
+    """
+    try:
+        # Get files from vector repository
+        files = await vector_repository.list_documents(db)
+        
+        # Format response
+        formatted_files = []
+        for file in files:
+            formatted_files.append({
+                "filename": file["filename"],
+                "description": file["description"],
+                "created_at": file["created_at"],
+                "updated_at": file["updated_at"]
+            })
+        
+        return {
+            "success": True,
+            "message": f"Found {len(formatted_files)} markdown files",
+            "data": {
+                "files": formatted_files
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to list files: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to list files"
+        )
+
+@router.post("/upload",
+            summary="Upload a markdown document",
+            description="Upload a markdown document to be used for Q&A")
+async def upload_markdown(
+    file: UploadFile = File(...),
+    description: str = Form(None),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Endpoint to upload a markdown document.
+    
+    This endpoint:
+    1. Validates the uploaded file is a markdown file
+    2. Saves the file to the local file system
+    3. Processes the file for embeddings and vector storage
+    4. Returns the file information
+    """
+    try:
+        logger.info(f"Received file upload: {file.filename}")
+        
+        # Validate file type
+        if not file.filename.endswith(('.md', '.markdown')):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only markdown files (.md, .markdown) are accepted"
+            )
+        
+        # Create a safe filename
+        safe_filename = os.path.basename(file.filename)
+        file_path = os.path.join(UPLOAD_DIR, safe_filename)
+        
+        # Read file content
+        content = await file.read()
+        
+        # Save file to disk
+        async with aiofiles.open(file_path, 'wb') as f:
+            await f.write(content)
+        
+        # Convert content to string
+        content_str = content.decode('utf-8')
+        
+        # Process the document
+        result = await chatbot_service.process_upload(
+            db=db,
+            filename=safe_filename,
+            content=content_str,
+            description=description
+        )
+        
+        if not result["success"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=result["message"]
+            )
+        
+        return {
+            "success": True,
+            "message": f"File {safe_filename} uploaded and processed successfully",
+            "data": {
+                "filename": safe_filename,
+                "size": len(content),
+                "chunks": result["data"]["chunks"],
+                "document_id": result["data"]["document_id"]
+            }
+        }
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Failed to upload file: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload file: {str(e)}"
+        )
+
+@router.get("/file/{filename}",
+            summary="Get content of a markdown file",
+            description="Get the content of a specific markdown file")
+async def get_file_content(
+    filename: str,
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Endpoint to get the content of a markdown file.
+    """
+    try:
+        # Get document from vector repository
+        document = await vector_repository.get_document_by_filename(db, filename)
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"File {filename} not found"
+            )
+        
+        return {
+            "success": True,
+            "message": f"File {filename} found",
+            "data": {
+                "filename": document["filename"],
+                "content": document["content"],
+                "description": document["description"]
+            }
+        }
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Failed to get file content: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get file content: {str(e)}"
+        )
+
+@router.delete("/files/{filename}",
+            summary="Delete a markdown file",
+            description="Delete a specific markdown file")
+async def delete_file(
+    filename: str,
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Endpoint to delete a markdown file.
+    """
+    try:
+        # Delete document from vector repository
+        success = await vector_repository.delete_document(db, filename)
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"File {filename} not found"
+            )
+        
+        # Also delete the file from the file system
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        
+        return {
+            "success": True,
+            "message": f"File {filename} deleted successfully",
+            "data": None
+        }
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Failed to delete file: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete file: {str(e)}"
+        )
+
+@router.get("/status", 
+           summary="API status endpoint", 
+           description="Check status of API including database initialization")
+async def api_status(db: AsyncSession = Depends(get_async_db)):
+    """
+    Endpoint to check API status.
+    """
+    try:
+        # Get uptime
+        uptime = time.time() - chatbot_service.initialization_time
+        
+        # Get initialization status
+        initialized = chatbot_service.is_initialized
+        
+        # Calculate estimated wait time
+        estimated_wait_time = max(0, 60 - uptime) if not initialized else 0
+        
+        # Check if database is available by listing documents
+        documents = await vector_repository.list_documents(db)
+        
+        return {
+            "success": True,
+            "message": "API status",
+            "data": {
+                "status": "healthy",
+                "ready_for_queries": initialized or uptime > 60,
+                "uptime": f"{uptime:.1f}s",
+                "initialized": initialized,
+                "documents_count": len(documents),
+                "estimated_wait_time": int(estimated_wait_time)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get API status: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"API status check failed: {str(e)}",
+            "data": {
+                "status": "unhealthy",
+                "error": str(e)
+            }
+        }
 
 @router.get("/debug", 
            summary="Debug endpoint to check configuration", 
@@ -129,289 +382,6 @@ async def debug_info():
         }
     except Exception as e:
         logger.error(f"Debug endpoint error: {str(e)}", exc_info=True)
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@router.get("/files",
-            summary="List uploaded markdown files",
-            description="Get a list of all uploaded markdown files")
-async def list_files():
-    """
-    Endpoint to list all uploaded markdown files.
-    """
-    try:
-        # Use local file system storage for both development and production
-        files = []
-        if os.path.exists(UPLOAD_DIR):
-            for filename in os.listdir(UPLOAD_DIR):
-                if filename.endswith(('.md', '.markdown')):
-                    file_path = os.path.join(UPLOAD_DIR, filename)
-                    files.append({
-                        "filename": filename,
-                        "size": os.path.getsize(file_path),
-                        "last_modified": os.path.getmtime(file_path),
-                        "path": file_path
-                    })
-        
-        return {
-            "success": True,
-            "message": f"Found {len(files)} markdown files",
-            "data": {
-                "files": files
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to list files: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to list files"
-        )
-
-@router.post("/upload",
-            summary="Upload a markdown document",
-            description="Upload a markdown document to be used for Q&A")
-async def upload_markdown(
-    file: UploadFile = File(...),
-    description: str = Form(None)
-):
-    """
-    Endpoint to upload a markdown document.
-    
-    This endpoint:
-    1. Validates the uploaded file is a markdown file
-    2. Saves the file to the local file system
-    3. Returns the file information
-    """
-    try:
-        logger.info(f"Received file upload: {file.filename}")
-        
-        # Validate file type
-        if not file.filename.endswith(('.md', '.markdown')):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Only markdown files (.md, .markdown) are accepted"
-            )
-        
-        # Create a safe filename
-        safe_filename = os.path.basename(file.filename)
-        
-        # Read file content
-        content = await file.read()
-        
-        # Save to file system (both in development and production)
-        file_path = os.path.join(UPLOAD_DIR, safe_filename)
-        
-        # Save the file locally
-        async with aiofiles.open(file_path, 'wb') as out_file:
-            await out_file.write(content)
-        
-        logger.info(f"Successfully saved file to path: {file_path}")
-        
-        # Add a 2-second artificial delay to prevent immediate embedding generation 
-        # that might trigger rate limits when the frontend makes immediate requests
-        await asyncio.sleep(2)
-        
-        return {
-            "success": True,
-            "message": "File uploaded successfully",
-            "data": {
-                "filename": safe_filename,
-                "description": description,
-                "size": len(content),
-                "path": file_path,
-                "processing": True  # Signal to the frontend that processing is happening
-            }
-        }
-        
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Failed to upload file: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to upload file"
-        )
-
-@router.get("/file/{filename}",
-            summary="Get content of a markdown file",
-            description="Get the content of a specific markdown file")
-async def get_file_content(filename: str):
-    """
-    Endpoint to get the content of a markdown file.
-    """
-    try:
-        # Use local file system for both development and production
-        file_path = os.path.join(UPLOAD_DIR, filename)
-        
-        if not os.path.exists(file_path):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="File not found"
-            )
-        
-        async with aiofiles.open(file_path, 'r', encoding='utf-8') as file:
-            content = await file.read()
-        
-        return {
-            "success": True,
-            "message": "File content retrieved successfully",
-            "data": {
-                "filename": filename,
-                "content": content,
-                "path": file_path
-            }
-        }
-        
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Failed to get file content: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to get file content"
-        )
-
-@router.delete("/files/{filename}",
-            summary="Delete a markdown file",
-            description="Delete a specific markdown file")
-async def delete_file(filename: str):
-    """
-    Endpoint to delete a markdown file.
-    """
-    try:
-        logger.info(f"Attempting to delete file: {filename}")
-        
-        # Use local file system for both development and production
-        file_path = os.path.join(UPLOAD_DIR, filename)
-        
-        if not os.path.exists(file_path):
-            logger.warning(f"File not found for deletion: {file_path}")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="File not found"
-            )
-        
-        # Delete the file
-        os.remove(file_path)
-        logger.info(f"Successfully deleted file: {file_path}")
-        
-        return {
-            "success": True,
-            "message": f"File {filename} deleted successfully",
-            "data": {
-                "filename": filename
-            }
-        }
-        
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Failed to delete file: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete file"
-        )
-
-@router.get("/status", 
-           summary="API status endpoint", 
-           description="Check status of API including embedding initialization")
-async def api_status():
-    """
-    Status endpoint to check if the API is ready for use.
-    """
-    from app.services.chatbot_service import is_embedding_initialized, is_template_initialization_in_progress, initialization_start_time, MAX_INITIALIZATION_TIME
-    
-    try:
-        # Calculate how long initialization has been running
-        initialization_time_elapsed = 0
-        initialization_timeout = False
-        
-        # Track cold start status (to help frontend decide on wait times)
-        # Assume it's a cold start if initialization started very recently
-        import time
-        current_time = time.time()
-        is_cold_start = False
-        cold_start_remaining = 0
-        
-        # Render free tier typically takes ~50 seconds for cold start
-        COLD_START_THRESHOLD = 30  # seconds since server start
-        COLD_START_DURATION = 50  # total expected cold start time
-        
-        if initialization_start_time > 0:
-            initialization_time_elapsed = int(current_time - initialization_start_time)
-            
-            # Check if we're in cold start period
-            if initialization_time_elapsed < COLD_START_THRESHOLD:
-                is_cold_start = True
-                cold_start_remaining = max(0, COLD_START_DURATION - initialization_time_elapsed)
-            
-            # Check if initialization has timed out
-            if initialization_time_elapsed > MAX_INITIALIZATION_TIME:
-                initialization_timeout = True
-        
-        # Get embedding initialization status
-        embedding_status = {
-            "initialized": is_embedding_initialized,
-            "initialization_in_progress": is_template_initialization_in_progress,
-            "initialization_time_elapsed": initialization_time_elapsed,
-            "initialization_timeout": initialization_timeout,
-            "max_initialization_time": MAX_INITIALIZATION_TIME
-        }
-        
-        # Check if template embedding cache exists
-        cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cache")
-        template_cache_path = os.path.join(cache_dir, "template_embeddings.json")
-        cache_exists = os.path.exists(template_cache_path)
-        
-        if cache_exists:
-            try:
-                with open(template_cache_path, 'r') as f:
-                    cached_data = json.load(f)
-                cache_info = {
-                    "exists": True,
-                    "template_count": len(cached_data),
-                    "last_modified": os.path.getmtime(template_cache_path)
-                }
-            except Exception as e:
-                cache_info = {
-                    "exists": True,
-                    "error": str(e),
-                    "last_modified": os.path.getmtime(template_cache_path)
-                }
-        else:
-            cache_info = {
-                "exists": False
-            }
-        
-        # System is ready if embeddings are initialized OR initialization timeout occurred
-        system_ready = is_embedding_initialized or initialization_timeout
-        
-        # Determine wait time based on cold start and embedding status
-        wait_time = 0
-        if is_cold_start:
-            wait_time = cold_start_remaining
-        elif not system_ready:
-            wait_time = min(30, MAX_INITIALIZATION_TIME - initialization_time_elapsed)
-        
-        return {
-            "success": True,
-            "message": "API status check completed",
-            "data": {
-                "api_online": True,
-                "embedding_service": embedding_status,
-                "template_cache": cache_info,
-                "ready_for_queries": system_ready,
-                "estimated_wait_time": wait_time,
-                "is_cold_start": is_cold_start,
-                "cold_start_remaining": cold_start_remaining,
-                "server_start_time": initialization_start_time
-            }
-        }
-    except Exception as e:
-        logger.error(f"Status endpoint error: {str(e)}", exc_info=True)
         return {
             "success": False,
             "error": str(e)
