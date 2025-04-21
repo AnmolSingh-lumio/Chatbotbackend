@@ -27,11 +27,16 @@ class EmbeddingService:
             logger.error("OPENAI_API_KEY not found in environment variables")
             raise ValueError("OPENAI_API_KEY not found in environment variables")
             
-        # Initialize OpenAI client with only the required parameters
-        # Removed any potential proxies parameter that might be causing issues
-        self.client = OpenAI(
-            api_key=self.api_key,
-        )
+        # Initialize OpenAI client - Simple initialization for older version
+        try:
+            self.client = OpenAI(api_key=self.api_key)
+            logger.info("OpenAI embedding client initialized successfully")
+        except TypeError as e:
+            logger.error(f"Error initializing OpenAI embedding client: {str(e)}")
+            # Fallback with bare minimum parameters
+            logger.info("Trying fallback initialization for embedding client")
+            self.client = OpenAI()
+            self.client.api_key = self.api_key
         
         # Set embedding model name
         self.model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
