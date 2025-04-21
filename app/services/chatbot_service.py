@@ -37,8 +37,11 @@ class ChatbotService:
             logger.error("OPENAI_API_KEY not found in environment variables")
             raise ValueError("OPENAI_API_KEY not found in environment variables")
             
-        # Initialize OpenAI client
-        self.client = OpenAI(api_key=self.api_key)
+        # Initialize OpenAI client with only the required parameters
+        # Removed any potential proxies parameter that might be causing issues
+        self.client = OpenAI(
+            api_key=self.api_key,
+        )
         
         # Get LLM model name
         self.model_name = os.getenv("MODEL_NAME", "gpt-4o")
