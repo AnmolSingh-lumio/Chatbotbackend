@@ -419,9 +419,15 @@ class ChunkingService:
         
         # Try to use NLTK for better sentence tokenization
         try:
-            sentences = sent_tokenize(content)
+            # Explicitly verify punkt is available before using it
+            if nltk.data.find('tokenizers/punkt'):
+                sentences = sent_tokenize(content)
+            else:
+                # Fallback if punkt not found
+                sentences = re.split(r'(?<=[.!?])\s+', content)
         except Exception as e:
             logger.warning(f"Error using NLTK tokenizer: {e}. Falling back to regex-based splitting.")
+            # Use regex as fallback
             sentences = re.split(r'(?<=[.!?])\s+', content)
         
         current_chunk = ""

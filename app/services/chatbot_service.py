@@ -358,6 +358,48 @@ class ChatbotService:
                             "required": ["document_id"]
                         }
                     }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "analyze_earned_discounts",
+                        "description": "Analyzes earned discount structures within a contract. Use this function to examine discount tiers, eligibility requirements, and how volume changes affect discount rates. This is particularly useful for questions about pricing tiers, volume requirements, and discount calculations.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "service_type": {
+                                    "type": "string",
+                                    "description": "The specific service type to analyze discounts for (e.g., 'Ground', 'SmartPost', 'Express'). If not specified, will analyze all services."
+                                },
+                                "document_id": {
+                                    "type": "integer",
+                                    "description": "ID of the document to analyze. Use the document_id from the current context."
+                                }
+                            },
+                            "required": ["document_id"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "analyze_carrier_discounts",
+                        "description": "Analyzes carrier-specific discount structures within a contract. This tool is specialized for identifying pricing incentives by carrier (UPS, FedEx, etc.) and understanding how each carrier structures their discount programs differently. Use this for comparing different carrier models and their specific terminology.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "carrier": {
+                                    "type": "string",
+                                    "description": "The specific carrier to analyze discounts for (e.g., 'UPS', 'FedEx', 'DHL'). If not specified, will determine carrier from document context."
+                                },
+                                "document_id": {
+                                    "type": "integer",
+                                    "description": "ID of the document to analyze. Use the document_id from the current context."
+                                }
+                            },
+                            "required": ["document_id"]
+                        }
+                    }
                 }
             ]
             
@@ -440,6 +482,14 @@ class ChatbotService:
                                 result = {"error": "Document not found"}
                         else:
                             result = {"error": "No document ID provided"}
+                    elif function_name == "analyze_earned_discounts":
+                        # Analyze earned discounts
+                        service_type = function_args.get("service_type", "all")
+                        result = self.analyze_earned_discounts(service_type, document_id)
+                    elif function_name == "analyze_carrier_discounts":
+                        # Analyze carrier-specific discounts
+                        carrier = function_args.get("carrier", "UPS")
+                        result = self.analyze_carrier_discounts(carrier, document_id)
                     else:
                         result = f"Unknown function: {function_name}"
                     
@@ -553,6 +603,26 @@ class ChatbotService:
         8. For complex questions, gather context from multiple relevant sections before answering
         9. Maintain confidentiality and professional tone at all times
         
+        IMPORTANT NOTES ON SEARCH:
+        1. If you don't find exact information using the retrieve_document_chunks tool, try with alternative terms
+        2. Look for related concepts and similar language that might address the question
+        3. Many legal concepts may be described using different terminology than the user's query
+        4. Consider section titles, headers, and document structure when searching for information
+        5. If you're unsure if a concept exists in the document, clearly indicate that you couldn't find explicit information
+           but explain what related information you did find
+        
+        SPECIFIC CONTRACT KNOWLEDGE:
+        1. When addressing questions about earned discounts, note that FedEx contracts typically base discounts on Annualized Transportation Charges
+        2. Earned discounts are typically structured in tiers based on spending thresholds (e.g., $400K-$650K, $650K-$900K)
+        3. When volume drops, earned discount tiers generally apply based on actual spending without grace periods
+        4. Earned discounts apply to base rates but not to ancillary fees, surcharges, or other charges
+        5. Discount programs may have specific eligibility requirements for shipments
+        6. For UPS contracts, look for "Portfolio Tier Incentive" sections that detail how discounts are structured
+        7. UPS typically uses a 52-week rolling average of eligible package charges to determine discount tiers
+        8. UPS discount tiers are often service-specific with different percentages for different shipping services
+        9. UPS discounts are typically administered on a weekly basis rather than annually
+        10. For temporary volume drops, UPS Force Majeure provisions may adjust the average weekly revenue for tier determination
+        
         When analyzing contracts:
         - First retrieve relevant sections using the retrieve_document_chunks tool
         - Always cite the document name/ID in your responses for clarity
@@ -583,3 +653,127 @@ class ChatbotService:
         messages.append({"role": "user", "content": question})
         
         return messages 
+        
+    def analyze_earned_discounts(self, service_type: str, document_id: Optional[int]) -> Dict[str, Any]:
+        """
+        Analyze earned discount structures in the contract.
+        
+        This function doesn't actually perform a direct analysis, but instead acts as a 
+        connector to prompt the chatbot to search for and analyze specific sections related 
+        to earned discounts in the document.
+        
+        Args:
+            service_type: The specific service type to analyze (e.g., 'Ground', 'SmartPost')
+            document_id: ID of the document being analyzed
+            
+        Returns:
+            Dictionary with instructions for the chatbot to analyze earned discounts
+        """
+        return {
+            "instruction": f"Analyze earned discounts for service type: {service_type}",
+            "document_id": document_id,
+            "search_terms": [
+                "earned discount",
+                "volume discount",
+                "discount tier",
+                "annualized transportation charges",
+                "tier discount",
+                "incentive",
+                "pricing tier",
+                "portfolio tier incentive",
+                "weekly charges bands",
+                "52 week rolling average",
+                "force majeure",
+                "weekly average"
+            ],
+            "analysis_guidance": [
+                "Look for discount percentage tiers based on spending ranges",
+                "Check if there are grace periods for maintaining discount levels when volume drops",
+                "Note which services are eligible for earned discounts",
+                "Identify what charges the discounts apply to (base rates vs. surcharges)",
+                "Check for minimum volume requirements or average shipment weights",
+                "Look for any time periods or measurement periods for calculating tiers",
+                "For UPS contracts, check for 'Portfolio Tier Incentive' sections",
+                "Identify if the carrier adjusts average revenue during Force Majeure events",
+                "Note if discounts are administered weekly, monthly, quarterly, or annually",
+                "Check if different services have different discount percentages in the same tier"
+            ]
+        }
+        
+    def analyze_carrier_discounts(self, carrier: str, document_id: Optional[int]) -> Dict[str, Any]:
+        """
+        Analyze carrier-specific discount structures in the contract.
+        
+        This function guides the chatbot to search for and analyze sections related to 
+        a specific carrier's discount structure and terminology.
+        
+        Args:
+            carrier: The carrier name to analyze (e.g., 'UPS', 'FedEx')
+            document_id: ID of the document being analyzed
+            
+        Returns:
+            Dictionary with carrier-specific instructions for the chatbot
+        """
+        carrier_specific_terms = {
+            "UPS": [
+                "portfolio tier incentive",
+                "weekly charges bands",
+                "52 week rolling average",
+                "committed services",
+                "incentives off effective rates",
+                "electronic pld bonus",
+                "force majeure"
+            ],
+            "FedEx": [
+                "earned discount",
+                "annualized transportation charges",
+                "program number",
+                "earned discount program details",
+                "eligible shipments",
+                "grace period"
+            ]
+        }
+        
+        carrier_specific_guidance = {
+            "UPS": [
+                "Identify the 'Portfolio Tier Incentive' section which explains how UPS structures discounts",
+                "Note how the 52-week rolling average works for determining discount tiers",
+                "Check which services are included in determining the weekly charges bands",
+                "Examine if there's any provision for adjusting the weekly average during Force Majeure events",
+                "Look for service-specific discount percentages across different tiers",
+                "Note whether the incentives are applied weekly, monthly, or on another schedule",
+                "Check if there's an Electronic PLD bonus that provides additional discounts"
+            ],
+            "FedEx": [
+                "Locate the 'Earned Discount Program Details' section that explains FedEx's discount structure",
+                "Identify the tiers based on Annualized Transportation Charges",
+                "Check for specific Program Numbers that might apply to different service categories",
+                "Note whether there's any grace period mentioned for maintaining higher discount tiers",
+                "Examine which shipments are eligible for earned discounts",
+                "Look for statements about how earned discounts are applied to rates"
+            ]
+        }
+        
+        # Default to generic terms and guidance if carrier not recognized
+        search_terms = carrier_specific_terms.get(carrier, [
+            "discount", 
+            "incentive", 
+            "pricing tier",
+            "volume"
+        ])
+        
+        analysis_guidance = carrier_specific_guidance.get(carrier, [
+            "Look for discount percentage tiers based on spending or volume",
+            "Check how the carrier structures their discount program",
+            "Identify time periods used for calculating discount eligibility",
+            "Note any special provisions for volume fluctuations"
+        ])
+        
+        return {
+            "instruction": f"Analyze {carrier} discount structure and terminology",
+            "document_id": document_id,
+            "carrier": carrier,
+            "search_terms": search_terms,
+            "analysis_guidance": analysis_guidance,
+            "additional_note": "Remember that different carriers use different terminology and structures for their discount programs. Look for the carrier's specific approach to volume-based pricing."
+        } 

@@ -166,16 +166,25 @@ class VectorRepository:
                     
                     # Create chunks from sections matching keywords
                     sections = self._split_by_headers(document_content)
+                    logger.info(f"Found {len(sections)} sections to search through")
+                    
                     for section_title, section_content in sections:
                         # Check if any keyword is in this section
-                        if any(keyword.lower() in section_content.lower() for keyword in keywords):
+                        matches = []
+                        for keyword in keywords:
+                            if keyword.lower() in section_content.lower():
+                                matches.append(keyword)
+                        
+                        if matches:
+                            logger.info(f"Found match in section '{section_title}' with keywords: {matches}")
                             keyword_chunks.append({
                                 "content": section_content,
                                 "metadata": {
                                     "section": section_title,
                                     "document_id": document_id,
                                     "filename": doc_info.get('filename'),
-                                    "source": "keyword_search"
+                                    "source": "keyword_search",
+                                    "matched_keywords": matches
                                 },
                                 "score": 0.8  # Assign a default score for keyword matches
                             })
@@ -189,17 +198,21 @@ class VectorRepository:
                     logger.info(f"Using {len(keyword_chunks)} results from keyword search")
                     # Convert keyword chunks to the same format as vector search results
                     for chunk in keyword_chunks[:limit]:
-                        results.append((
-                            Document(
-                                page_content=chunk["content"],
-                                metadata={
-                                    "section": chunk["metadata"]["section"],
-                                    "document_id": document_id,
-                                    "filename": doc_info.get('filename')
-                                }
-                            ),
-                            0.2  # Lower score means higher similarity in this API
-                        ))
+                        try:
+                            results.append((
+                                LangchainDocument(
+                                    page_content=chunk["content"],
+                                    metadata={
+                                        "section": chunk["metadata"]["section"],
+                                        "document_id": document_id,
+                                        "filename": doc_info.get('filename')
+                                    }
+                                ),
+                                0.2  # Lower score means higher similarity in this API
+                            ))
+                            logger.info(f"Added keyword chunk from section '{chunk['metadata']['section']}' to results")
+                        except Exception as e:
+                            logger.error(f"Error creating LangchainDocument for keyword chunk: {e}")
             else:
                 # If no document_id, just use vector search across all documents
                 results = self.vector_store.similarity_search_with_score(
@@ -286,7 +299,7 @@ class VectorRepository:
     def _extract_keywords(self, query: str) -> List[str]:
         """Extract important keywords from the query"""
         # Remove common words and keep only significant terms
-        common_words = {"the", "a", "an", "in", "on", "at", "is", "are", "what", "who", "where", "when", "why", "how", "and", "or", "but", "of", "for", "with", "does", "do", "has", "have", "had"}
+        common_words = {"the", "a", "an", "in", "on", "at", "is", "are", "what", "who", "where", "when", "why", "how", "and", "or", "but", "of", "for", "with", "does", "do", "has", "have", "had", "will", "would", "could", "should", "can", "may", "might", "must", "if", "then", "than", "that", "this", "these", "those", "there", "their", "they", "them", "to", "from", "by", "be", "been", "being", "am", "was", "were"}
         words = query.lower().split()
         
         # Keep only significant terms (non-common words with at least 3 characters)
@@ -298,15 +311,55 @@ class VectorRepository:
         # Remove empty strings after cleaning
         keywords = [word for word in keywords if word]
         
+        # Add contract-specific term variations
+        expanded_keywords = keywords.copy()
+        
+        # Handle common contract term variations
+        term_variations = {
+            "discount": ["rebate", "reduction", "deduction", "allowance", "credit"],
+            "grace": ["waiver", "allowance", "exception", "exemption", "relief"],
+            "volume": ["quantity", "amount", "shipment", "size"],
+            "earned": ["accrued", "accumulated", "achieved"],
+            "include": ["contain", "specify", "state", "mention", "describe"],
+            "surcharge": ["fee", "additional", "extra", "charge", "premium"],
+            "fuel": ["petrol", "diesel", "gas", "energy"],
+            "calculate": ["compute", "determine", "assess", "measure"],
+            "contract": ["agreement", "document", "arrangement", "terms"],
+            "temporarily": ["short-term", "brief", "temporary", "interim", "provisional"],
+            "drop": ["decrease", "decline", "reduction", "fall", "diminish"]
+        }
+        
+        # Add variations of keywords
+        for keyword in keywords:
+            # Check if we have variations for this keyword
+            if keyword in term_variations:
+                # Add all variations
+                expanded_keywords.extend(term_variations[keyword])
+        
+        # Remove duplicates
+        expanded_keywords = list(set(expanded_keywords))
+        
+        # Generate compound keywords for multi-word concepts
+        compound_keywords = []
+        # Create 2-word combinations from original query for multi-word concepts
+        words = query.lower().split()
+        for i in range(len(words) - 1):
+            compound = words[i] + " " + words[i+1]
+            if len(compound) > 5:  # Only add meaningful compounds
+                compound_keywords.append(compound)
+                
+        # Combine all keywords
+        all_keywords = expanded_keywords + compound_keywords
+        
         # If we end up with no keywords, use the most significant words from the original query
-        if not keywords and words:
+        if not all_keywords and words:
             # Sort words by length (longer words tend to be more significant)
             sorted_words = sorted(words, key=len, reverse=True)
             # Take up to 3 of the longest words
-            keywords = [word for word in sorted_words[:3] if len(word) > 2]
+            all_keywords = [word for word in sorted_words[:3] if len(word) > 2]
         
-        logger.info(f"Extracted keywords from query: {keywords}")
-        return keywords
+        logger.info(f"Extracted keywords from query: {all_keywords}")
+        return all_keywords
     
     def _split_by_headers(self, content: str) -> List[tuple]:
         """Split content by headers for keyword search"""
