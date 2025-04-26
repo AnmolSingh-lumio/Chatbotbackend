@@ -6,7 +6,8 @@ import logging
 import time
 import json
 import asyncio
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Dict, Any, Optional, Tuple
 from openai import OpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -38,8 +39,10 @@ class ChatbotService:
             
         # Initialize client
         self.client = OpenAI(api_key=self.openai_api_key)
-        self.model_name = os.getenv("OPENAI_MODEL", "gpt-4o")
-        logger.info(f"Using OpenAI model: {self.model_name}")
+        self.default_model = os.getenv("OPENAI_MODEL", "gpt-4o")
+        self.reasoning_model = os.getenv("OPENAI_REASONING_MODEL", "gpt-4-turbo")
+        logger.info(f"Using default OpenAI model: {self.default_model}")
+        logger.info(f"Using reasoning OpenAI model: {self.reasoning_model}")
         
         # Initialize supporting services
         self.chunking_service = ChunkingService()
@@ -63,7 +66,7 @@ class ChatbotService:
             
             # Test connection to OpenAI API
             test_response = self.client.chat.completions.create(
-                model=self.model_name,
+                model=self.default_model,
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": "Respond with OK to test the connection."}
@@ -87,6 +90,68 @@ class ChatbotService:
         finally:
             self.is_initializing = False
         
+    async def determine_model_for_query(self, query: str) -> Tuple[str, str]:
+        """
+        Determine which model to use based on the query content.
+        
+        Args:
+            query: The user's question
+            
+        Returns:
+            Tuple containing (model_name, reasoning)
+        """
+        logger.info(f"Determining appropriate model for query: {query}")
+        
+        try:
+            # Use a lightweight model to classify the query
+            classifier_response = self.client.chat.completions.create(
+                model="gpt-4o-mini",  # Using a faster, cheaper model for classification
+                messages=[
+                    {"role": "system", "content": """
+                    You are a query classifier that determines whether a question requires complex reasoning or straightforward information retrieval.
+                    
+                    For REASONING queries (use reasoning model):
+                    - Questions requiring analysis across multiple sections of a document
+                    - Questions about implications, comparisons, or consequences
+                    - "What if" scenarios or hypothetical questions
+                    - Requests for explanations of complex clauses or terms
+                    - Questions about relationships between different parts of a document
+                    
+                    For INFORMATION RETRIEVAL queries (use standard model):
+                    - Direct factual questions with clear answers in the document
+                    - Requests to find specific information like dates, parties, or amounts
+                    - Simple clarification questions about document content
+                    - Requests for definitions explicitly stated in the document
+                    
+                    Respond with ONLY ONE of these two words:
+                    - "REASONING" if the query requires complex reasoning capabilities
+                    - "STANDARD" if the query requires straightforward information retrieval
+                    """}, 
+                    {"role": "user", "content": query}
+                ],
+                temperature=0.1,
+                max_tokens=20,
+            )
+            
+            classification = classifier_response.choices[0].message.content.strip().upper()
+            
+            # Determine which model to use based on classification
+            if "REASONING" in classification:
+                model_choice = self.reasoning_model
+                reasoning = "Query classified as requiring complex reasoning capabilities"
+                logger.info(f"Selected reasoning model ({self.reasoning_model}) for query")
+            else:
+                model_choice = self.default_model
+                reasoning = "Query classified as requiring standard information retrieval"
+                logger.info(f"Selected standard model ({self.default_model}) for query")
+                
+            return model_choice, reasoning
+            
+        except Exception as e:
+            logger.error(f"Error determining model for query: {str(e)}")
+            logger.info(f"Defaulting to standard model ({self.default_model})")
+            return self.default_model, "Error in classification, defaulting to standard model"
+
     async def process_upload(
         self, 
         db: AsyncSession, 
@@ -188,6 +253,10 @@ class ChatbotService:
         logger.info(f"Processing question: {question}")
         logger.info(f"Document context - ID: {document_id}, Filename: {filename}")
         
+        # Determine which model to use for this query
+        model_to_use, model_reasoning = await self.determine_model_for_query(question)
+        logger.info(f"Model selection: {model_to_use} - {model_reasoning}")
+        
         # Check if we're still initializing
         global is_initialized, initialization_time
         uptime = time.time() - initialization_time
@@ -256,17 +325,17 @@ class ChatbotService:
                     "type": "function",
                     "function": {
                         "name": "retrieve_document_chunks",
-                        "description": "Retrieve chunks from documents that are relevant to the query",
+                        "description": "This tool should be executed to retrieve relevant contract document chunks based on the query. It should always be called first to gather context about the specific contract being analyzed. It can be re-run multiple times with refined queries to gather more specific information from different sections of the document. Always prioritize searching within the current document context first.",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "query": {
                                     "type": "string",
-                                    "description": "The query to search for in the document"
+                                    "description": "The specific query to search for in the document. Be precise and include key terms from the user's question to retrieve the most relevant sections."
                                 },
                                 "limit": {
                                     "type": "integer",
-                                    "description": "Maximum number of chunks to retrieve"
+                                    "description": "Maximum number of chunks to retrieve. Use higher values (5-10) for complex questions requiring broader context, and lower values (2-3) for specific questions."
                                 }
                             },
                             "required": ["query"]
@@ -277,13 +346,13 @@ class ChatbotService:
                     "type": "function",
                     "function": {
                         "name": "get_document_metadata",
-                        "description": "Get metadata about a document",
+                        "description": "Retrieve metadata about the current contract document, including filename, creation date, and document description. Use this tool when you need to understand the document's origin, type, or when providing context about which document is being analyzed.",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "document_id": {
                                     "type": "integer",
-                                    "description": "ID of the document"
+                                    "description": "ID of the document to retrieve metadata for. Use the document_id from the current context if available."
                                 }
                             },
                             "required": ["document_id"]
@@ -297,9 +366,9 @@ class ChatbotService:
             all_used_contexts = []
             
             while tool_calls_remaining > 0:
-                # Call OpenAI API
+                # Call OpenAI API with the selected model
                 response = self.client.chat.completions.create(
-                    model=self.model_name,
+                    model=model_to_use,  # Use the determined model here
                     messages=messages,
                     temperature=0.3,
                     tools=tools,
@@ -395,7 +464,7 @@ class ChatbotService:
             if not final_answer and tool_calls_remaining == 0:
                 # If we ran out of tool calls, generate a final answer
                 final_response = self.client.chat.completions.create(
-                    model=self.model_name,
+                    model=model_to_use,  # Use the determined model here as well
                     messages=messages,
                     temperature=0.3,
                 )
@@ -418,7 +487,9 @@ class ChatbotService:
                     "processing_time": processing_time,
                     "contexts_used": len(all_used_contexts),
                     "document_id": document_id,
-                    "filename": filename
+                    "filename": filename,
+                    "model_used": model_to_use,
+                    "model_selection_reason": model_reasoning
                 }
             }
             
@@ -460,23 +531,33 @@ class ChatbotService:
         
         # System prompt for the chatbot
         system_prompt = f"""
-        You are a Contract Analysis Chatbot specialized in analyzing legal documents and contracts.
+        You are a Contract Analysis Chatbot specialized in analyzing legal documents and contracts. Your purpose is to help users understand, interpret, and extract information from complex legal agreements.
         
         {document_context}
         
-        Your task is to:
-        1. Only provide information that is explicitly found in the CURRENT document being analyzed
-        2. NEVER mix information between different contracts - each contract is a separate document
-        3. Each question refers to a specific contract indicated in the interface - maintain strict document context
-        4. If the current document doesn't contain the specific information requested, clearly state this
-        5. When using content from documents, be precise and cite sections/clauses where possible
+        CAPABILITIES:
+        1. Retrieve and analyze specific sections of contracts
+        2. Extract key entities like parties, dates, monetary values, and obligations
+        3. Interpret legal language and explain implications in plain English
+        4. Compare clauses against standard contract language
+        5. Identify potential risks, obligations, or important terms
         
-        Guidelines:
-        - Your answers should be specific to only the current document being queried
-        - Do not apply information from one contract to another, even if they appear similar
-        - Be precise: if dates, parties, or specifics differ between contracts, reflect those differences
-        - If you can't find relevant information in the current document chunks, say so directly
-        - When providing answers, include the document name/ID to clarify which document you're referencing
+        GUIDELINES:
+        1. ONLY provide information that exists in the current document being analyzed
+        2. Maintain strict document context - each question refers to the specific contract indicated
+        3. NEVER mix information between different contracts even if they seem similar
+        4. When information isn't available in the current document, clearly state this
+        5. Cite specific sections or clauses when providing answers
+        6. Use legal expertise to interpret complex language, but remain factual
+        7. Be precise about dates, parties, amounts, and other specific details
+        8. For complex questions, gather context from multiple relevant sections before answering
+        9. Maintain confidentiality and professional tone at all times
+        
+        When analyzing contracts:
+        - First retrieve relevant sections using the retrieve_document_chunks tool
+        - Always cite the document name/ID in your responses for clarity
+        
+        Your goal is to provide accurate, contextually relevant information based strictly on the content of the specific document being queried.
         """
         
         # Initialize messages with system prompt

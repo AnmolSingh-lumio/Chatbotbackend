@@ -190,7 +190,7 @@ class VectorRepository:
                     # Convert keyword chunks to the same format as vector search results
                     for chunk in keyword_chunks[:limit]:
                         results.append((
-                            LangchainDocument(  # Use LangchainDocument instead of Document
+                            Document(
                                 page_content=chunk["content"],
                                 metadata={
                                     "section": chunk["metadata"]["section"],

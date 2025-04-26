@@ -20,3 +20,7 @@ asyncpg
 langchain
 langchain-openai
 langchain-community
+nltk 
+beautifulsoup4
+markdown
+pandas
